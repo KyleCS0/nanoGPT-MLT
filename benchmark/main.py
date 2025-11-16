@@ -16,64 +16,52 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from model import GPT, GPTConfig, Block
 
 # --- Patched Model for Per-phase Timing ---
-class PatchedBlock(Block):
-    def __init__(self, config):
-        super().__init__(config)
+def _forward_stepwise_for_timing(model, idx, timings):
+    """Forward pass mirroring GPT.forward, with CUDA event timings per phase."""
+    device = idx.device
+    b, t = idx.size()
+    assert t <= model.config.block_size, "Sequence too long"
+    pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-    def forward(self, x, timings):
+    # Embedding
+    emb_start = torch.cuda.Event(enable_timing=True)
+    emb_end = torch.cuda.Event(enable_timing=True)
+    emb_start.record()
+    tok_emb = model.transformer.wte(idx)
+    pos_emb = model.transformer.wpe(pos)
+    x = model.transformer.drop(tok_emb + pos_emb)
+    emb_end.record()
+    timings['embedding'].append((emb_start, emb_end))
+
+    # Blocks
+    for block in model.transformer.h:
         # Attention
         attn_start = torch.cuda.Event(enable_timing=True)
         attn_end = torch.cuda.Event(enable_timing=True)
         attn_start.record()
-        x = x + self.attn(self.ln_1(x))
+        x = x + block.attn(block.ln_1(x))
         attn_end.record()
         timings['attention'].append((attn_start, attn_end))
-        
+
         # MLP
         mlp_start = torch.cuda.Event(enable_timing=True)
         mlp_end = torch.cuda.Event(enable_timing=True)
         mlp_start.record()
-        x = x + self.mlp(self.ln_2(x))
+        x = x + block.mlp(block.ln_2(x))
         mlp_end.record()
         timings['mlp'].append((mlp_start, mlp_end))
-        
-        return x
 
-class PatchedGPT(GPT):
-    def __init__(self, config):
-        super().__init__(config)
-        self.transformer.h = torch.nn.ModuleList([PatchedBlock(config) for _ in range(config.n_layer)])
+    x = model.transformer.ln_f(x)
 
-    def forward(self, idx, timings):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, "Sequence too long"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+    # Head (project only last time step)
+    head_start = torch.cuda.Event(enable_timing=True)
+    head_end = torch.cuda.Event(enable_timing=True)
+    head_start.record()
+    logits = model.lm_head(x[:, [-1], :])
+    head_end.record()
+    timings['head'].append((head_start, head_end))
 
-        # Embedding
-        emb_start = torch.cuda.Event(enable_timing=True)
-        emb_end = torch.cuda.Event(enable_timing=True)
-        emb_start.record()
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        emb_end.record()
-        timings['embedding'].append((emb_start, emb_end))
-
-        for block in self.transformer.h:
-            x = block(x, timings)
-        
-        x = self.transformer.ln_f(x)
-
-        # Head (match inference path: project only last time step)
-        head_start = torch.cuda.Event(enable_timing=True)
-        head_end = torch.cuda.Event(enable_timing=True)
-        head_start.record()
-        logits = self.lm_head(x[:, [-1], :])
-        head_end.record()
-        timings['head'].append((head_start, head_end))
-
-        return logits, None
+    return logits, None
 
 def set_seed(seed):
     random.seed(seed)
@@ -97,18 +85,22 @@ def log_result(config, result):
         'prompt_length': config['prompt_length'],
         'batch_size': config['batch_size'],
         'seed': config['seed'],
+        'pretrained': config.get('pretrained', None),
         **result
     }
     os.makedirs(os.path.dirname(config['log_file']), exist_ok=True)
     with open(config['log_file'], 'a') as f:
         f.write(json.dumps(record) + '\n')
 
-def load_model(model_config, dtype_str):
+def load_model(model_config, dtype_str, pretrained=None):
     """
     Loads the nanoGPT model on the GPU.
     """
-    config = GPTConfig(**model_config)
-    model = GPT(config)
+    if pretrained:
+        model = GPT.from_pretrained(pretrained)
+    else:
+        config = GPTConfig(**model_config)
+        model = GPT(config)
     model.to("cuda")
 
     pt_dtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype_str]
@@ -153,7 +145,7 @@ def decode_loop(model, prompt, T):
 
 def run_latency_vs_T(config):
     print("Running Latency vs T benchmark...")
-    model = load_model(config['model_config'], config['dtype'])
+    model = load_model(config['model_config'], config['dtype'], config.get('pretrained'))
     prompt = create_prompt(config)
 
     for T in config['T_values']:
@@ -195,7 +187,7 @@ def run_latency_vs_T(config):
 
 def run_vram_vs_T(config):
     print("Running VRAM vs T benchmark...")
-    model = load_model(config['model_config'], config['dtype'])
+    model = load_model(config['model_config'], config['dtype'], config.get('pretrained'))
     prompt = create_prompt(config)
 
     for T in config['T_values']:
@@ -228,26 +220,23 @@ def run_vram_vs_T(config):
 def run_per_phase_timing(config):
     print("Running Per-phase timing benchmark...")
 
-    # --- Patched Decode Loop ---
+    # Load the same model as other benchmarks (incl. pretrained if set)
+    model = load_model(config['model_config'], config['dtype'], config.get('pretrained'))
+    pt_dtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[config['dtype']]
+    model.to(pt_dtype)
+    model.eval()
+
+    # --- Stepwise decode using the same model for timing ---
     @torch.no_grad()
-    def decode_loop_patched(model, prompt, T, timings):
+    def decode_loop_stepwise(model, prompt, T, timings):
         idx = prompt
         for _ in range(T):
             idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
-            logits, _ = model(idx_cond, timings)
+            logits, _ = _forward_stepwise_for_timing(model, idx_cond, timings)
             probs = torch.nn.functional.softmax(logits[:, -1, :], dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
-
-    # --- Benchmark Execution ---
-    model_config = config['model_config']
-    pt_dtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[config['dtype']]
-    
-    model = PatchedGPT(GPTConfig(**model_config))
-    model.to("cuda")
-    model.to(pt_dtype)
-    model.eval()
 
     prompt = create_prompt(config)
     T = config['T_star']
@@ -255,7 +244,7 @@ def run_per_phase_timing(config):
     # Warmup
     for _ in range(config['num_warmup_runs']):
         timings = {'embedding': [], 'attention': [], 'mlp': [], 'head': []}
-        decode_loop_patched(model, prompt, T, timings)
+        decode_loop_stepwise(model, prompt, T, timings)
 
     # Measurement
     all_run_phase_times = []
@@ -267,7 +256,7 @@ def run_per_phase_timing(config):
         total_end = torch.cuda.Event(enable_timing=True)
 
         total_start.record()
-        decode_loop_patched(model, prompt, T, timings)
+        decode_loop_stepwise(model, prompt, T, timings)
         total_end.record()
         torch.cuda.synchronize()
 
@@ -305,10 +294,19 @@ def main():
     parser.add_argument('benchmark', nargs='*', help="Benchmark(s) to run", default=['all'])
     parser.add_argument('--config', type=str, default='benchmark/config.yaml', help='Path to the config file.')
     parser.add_argument('--clear-log', action='store_true', help='Clear the results log file before running benchmarks.')
+    parser.add_argument('--preset', type=str, choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'],
+                        help='Use a pretrained GPT-2 preset for the model.')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Apply preset from CLI or config to use pretrained weights if requested
+    if args.preset:
+        config['pretrained'] = args.preset
+    else:
+        # honor config file if it already specified pretrained
+        config['pretrained'] = config.get('pretrained', 'gpt2')  # default to gpt2 per user request
 
     # Optionally clear the results log
     if args.clear_log:

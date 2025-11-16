@@ -10,6 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime, timezone
 
 # Set publication-quality style (serif, minimal, consistent)
 plt.rcParams.update({
@@ -52,6 +53,21 @@ def quadratic_fit(x, y):
     y = np.asarray(y, dtype=float)
     coeffs = np.polyfit(x, y, deg=2)
     return coeffs  # a, b, c
+
+
+def linear_fit(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m, b = np.polyfit(x, y, deg=1)
+    return m, b
+
+
+def r2_score(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    return float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 1.0
 
 
 def plot_latency_vs_T(data, output_dir):
@@ -273,6 +289,122 @@ def plot_per_phase_timing(data, output_dir):
     plt.close(fig_pie)
 
 
+def save_metrics_summary(results, output_dir):
+    """Write a concise JSON summary with fits and breakdowns."""
+    summary = {}
+
+    # Meta
+    any_key = next(iter(results)) if results else None
+    first_list = results.get(any_key, [{}])
+    meta_src = first_list[0] if first_list else {}
+    meta = {
+        'gpu': meta_src.get('gpu_name'),
+        'gpu_total_vram_bytes': meta_src.get('gpu_total_vram'),
+        'python_version': meta_src.get('python_version'),
+        'pytorch_version': meta_src.get('pytorch_version'),
+        'cuda_version': meta_src.get('cuda_version'),
+        'dtype': meta_src.get('dtype'),
+        'batch_size': meta_src.get('batch_size'),
+        'prompt_length': meta_src.get('prompt_length'),
+        'model_config': meta_src.get('model_config'),
+        'generated_at': datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Latency section
+    if 'latency_vs_T' in results and results['latency_vs_T']:
+        lat = sorted(results['latency_vs_T'], key=lambda d: d['T'])
+        T_vals = [int(d['T']) for d in lat]
+        total_ms = [float(d['time_total_ms_median']) for d in lat]
+        per_tok_ms = [float(d['time_per_token_ms_median']) for d in lat]
+
+        # Fits
+        a, b, c = quadratic_fit(T_vals, total_ms)
+        T_dense = np.asarray(T_vals, dtype=float)
+        total_fit = a * T_dense ** 2 + b * T_dense + c
+        r2_total = r2_score(total_ms, total_fit)
+
+        m_pt, b_pt = linear_fit(T_vals, per_tok_ms)
+        per_tok_fit = m_pt * T_dense + b_pt
+        r2_pt = r2_score(per_tok_ms, per_tok_fit)
+
+        summary['latency'] = {
+            'points': [
+                {'T': int(T_vals[i]),
+                 'total_ms': float(total_ms[i]),
+                 'per_token_ms': float(per_tok_ms[i])}
+                for i in range(len(T_vals))
+            ],
+            'fit_total_ms_vs_T': {
+                'model': 'quadratic',
+                'coeffs': {'a': float(a), 'b': float(b), 'c': float(c)},
+                'r2': float(r2_total),
+                'T_range': [int(min(T_vals)), int(max(T_vals))],
+            },
+            'fit_per_token_ms_vs_T': {
+                'model': 'linear',
+                'coeffs': {'m': float(m_pt), 'b': float(b_pt)},
+                'r2': float(r2_pt),
+                'T_range': [int(min(T_vals)), int(max(T_vals))],
+            },
+        }
+        meta['T_values'] = T_vals
+
+    # VRAM section
+    if 'vram_vs_T' in results and results['vram_vs_T']:
+        vram = sorted(results['vram_vs_T'], key=lambda d: d['T'])
+        T_vals_v = [int(d['T']) for d in vram]
+        abs_MB = [float(d['peak_memory_bytes']) / 1e6 for d in vram]
+        baseline = abs_MB[0]
+        delta_MB = [float(v - baseline) for v in abs_MB]
+
+        # Linear fit of delta vs T
+        m_v, b_v = linear_fit(T_vals_v, delta_MB)
+        y_pred_v = (np.asarray(T_vals_v, dtype=float) * m_v + b_v)
+        r2_v = r2_score(delta_MB, y_pred_v)
+
+        summary['vram'] = {
+            'unit': 'MB',
+            'baseline_T': int(T_vals_v[0]),
+            'points': [
+                {'T': int(T_vals_v[i]), 'abs_MB': float(abs_MB[i]), 'delta_MB': float(delta_MB[i])}
+                for i in range(len(T_vals_v))
+            ],
+            'fit_delta_MB_vs_T': {
+                'model': 'linear',
+                'coeffs': {'m': float(m_v), 'b': float(b_v)},
+                'r2': float(r2_v),
+                'T_range': [int(min(T_vals_v)), int(max(T_vals_v))],
+            },
+        }
+
+    # Per-phase section
+    if 'per_phase_timing' in results and results['per_phase_timing']:
+        rec = results['per_phase_timing'][-1]
+        phases = dict(rec.get('time_phase_ms', {}))
+        total = float(phases.get('total', 0.0))
+        # Percentages relative to total if available
+        percent = {}
+        for k, v in phases.items():
+            if k == 'total':
+                continue
+            pct = (float(v) / total) if total > 0 else 0.0
+            percent[k] = float(pct)
+
+        summary['per_phase'] = {
+            'T_star': int(rec.get('T_star', 0)),
+            'times_ms': {k: float(v) for k, v in phases.items()},
+            'percent': percent,
+        }
+
+    summary['meta'] = meta
+
+    # Save
+    out_path = Path(output_dir) / 'metrics_summary.json'
+    with open(out_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f"  Saved: {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate professional plots from nanoGPT benchmark results."
@@ -318,6 +450,10 @@ def main():
     if 'per_phase_timing' in results:
         print("Generating Per-phase Timing plots...")
         plot_per_phase_timing(results['per_phase_timing'], output_dir)
+
+    # Always emit JSON metrics summary
+    print("Writing metrics summary JSON...")
+    save_metrics_summary(results, output_dir)
     
     print()
     print(f"All plots saved to {output_dir}")
