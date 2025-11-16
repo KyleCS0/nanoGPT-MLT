@@ -1,0 +1,22 @@
+# benchmark/config.yaml
+
+# Model configuration
+model_config:
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  block_size: 1024
+  vocab_size: 50257
+
+# Execution configuration
+dtype: 'bfloat16' # 'float32', 'bfloat16', or 'float16'
+prompt_length: 32
+T_values: [64, 128, 256, 512]
+batch_size: 1
+num_warmup_runs: 3
+num_measure_runs: 10
+T_star: 512 # For per-phase timing
+seed: 1337
+
+# Output
+log_file: "benchmark/results.jsonl"
