@@ -129,25 +129,25 @@ def plot_latency_vs_T(data, output_dir):
 
 def plot_vram_vs_T(data, output_dir):
     """
-    Plot VRAM usage vs T: relative growth from first T point.
+    Plot VRAM usage vs T: relative growth from first T point (in MB).
     """
     # Sort by T value
     data = sorted(data, key=lambda x: x['T'])
     
     T_values = [d['T'] for d in data]
-    peak_memory_gb = [d['peak_memory_bytes'] / 1e9 for d in data]
+    peak_memory_mb = [d['peak_memory_bytes'] / 1e6 for d in data]
     
     # Baseline subtract: use first T point as baseline
-    baseline_memory_gb = peak_memory_gb[0]
-    relative_memory_gb = [mem - baseline_memory_gb for mem in peak_memory_gb]
+    baseline_memory_mb = peak_memory_mb[0]
+    relative_memory_mb = [mem - baseline_memory_mb for mem in peak_memory_mb]
     
     # Create standalone figure
     fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-    
-    ax.plot(T_values, relative_memory_gb, 'o-', linewidth=1.8, markersize=4.5,
+
+    ax.plot(T_values, relative_memory_mb, 'o-', linewidth=1.8, markersize=4.5,
             color='#2E86AB')
     ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
-    ax.set_ylabel('Additional Memory Usage (GB)', fontweight='bold')
+    ax.set_ylabel('Additional Memory Usage (MB)', fontweight='bold')
     ax.set_title('GPU Memory Growth vs Generation Length', fontweight='bold', pad=15)
     ax.set_xlim(left=min(T_values)*0.9, right=max(T_values)*1.05)
     ax.set_ylim(bottom=0)
@@ -155,12 +155,12 @@ def plot_vram_vs_T(data, output_dir):
     
     # Add system info
     if data:
-        total_vram_gb = data[0]['gpu_total_vram'] / 1e9
+        total_vram_mb = data[0]['gpu_total_vram'] / 1e6
         info = data[0]
         fig.text(0.5, 0.02,
-                 f"GPU: {info['gpu_name']} ({total_vram_gb:.1f} GB) | "
+                 f"GPU: {info['gpu_name']} ({total_vram_mb:.0f} MB) | "
                  f"dtype: {info['dtype']} | Batch Size: {info['batch_size']} | "
-                 f"Baseline (T={T_values[0]}): {baseline_memory_gb:.3f} GB",
+                 f"Baseline (T={T_values[0]}): {baseline_memory_mb:.1f} MB",
                  ha='center', fontsize=9, style='italic', color='#555555')
     
     plt.tight_layout(rect=[0, 0.04, 1, 1])
