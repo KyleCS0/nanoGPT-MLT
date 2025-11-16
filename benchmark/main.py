@@ -99,6 +99,7 @@ def log_result(config, result):
         'seed': config['seed'],
         **result
     }
+    os.makedirs(os.path.dirname(config['log_file']), exist_ok=True)
     with open(config['log_file'], 'a') as f:
         f.write(json.dumps(record) + '\n')
 
@@ -204,17 +205,22 @@ def run_vram_vs_T(config):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
-        
+
+        # Baseline allocation with model on device (weights, buffers)
+        baseline_alloc_bytes = torch.cuda.memory_allocated()
+
         # Measured run
         decode_loop(model, prompt, T)
         torch.cuda.synchronize()
-        
+
         peak_memory_bytes = torch.cuda.max_memory_allocated()
+        peak_activation_bytes = max(0, peak_memory_bytes - baseline_alloc_bytes)
         
         result = {
             'benchmark_name': 'vram_vs_T',
             'T': T,
             'peak_memory_bytes': peak_memory_bytes,
+            'peak_activation_bytes': peak_activation_bytes,
         }
         log_result(config, result)
         print(f"    Peak memory: {peak_memory_bytes / 1e9:.2f} GB")
@@ -298,10 +304,19 @@ def main():
     parser = argparse.ArgumentParser(description="nanoGPT benchmarking script.")
     parser.add_argument('benchmark', nargs='*', help="Benchmark(s) to run", default=['all'])
     parser.add_argument('--config', type=str, default='benchmark/config.yaml', help='Path to the config file.')
+    parser.add_argument('--clear-log', action='store_true', help='Clear the results log file before running benchmarks.')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Optionally clear the results log
+    if args.clear_log:
+        log_path = config['log_file']
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, 'w') as f:
+            f.write("")
+        print(f"Cleared log: {log_path}")
 
     set_seed(config['seed'])
 

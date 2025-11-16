@@ -11,7 +11,8 @@ model_config:
 # Execution configuration
 dtype: 'bfloat16' # 'float32', 'bfloat16', or 'float16'
 prompt_length: 32
-T_values: [64, 128, 256, 512]
+# More T values for smoother curves and clearer scaling (up to context limit)
+T_values: [32, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024]
 batch_size: 1
 num_warmup_runs: 3
 num_measure_runs: 10

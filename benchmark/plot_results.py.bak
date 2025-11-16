@@ -57,19 +57,21 @@ def quadratic_fit(x, y):
 def plot_latency_vs_T(data, output_dir):
     """
     Plot Latency vs T benchmark results.
-    Creates separate standalone plots for total time and per-token time.
+    Shows both total time and time per token.
     """
     # Sort by T value
     data = sorted(data, key=lambda x: x['T'])
     
     T_values = [d['T'] for d in data]
     time_total_median = [d['time_total_ms_median'] for d in data]
+    time_total_mean = [d['time_total_ms_mean'] for d in data]
     time_total_std = [d['time_total_ms_std'] for d in data]
     time_per_token = [d['time_per_token_ms_median'] for d in data]
     
-    # Plot 1: Total Time vs T (standalone)
-    fig1, ax1 = plt.subplots(1, 1, figsize=(8, 6))
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.8))
     
+    # Plot 1: Total Time vs T
     ax1.errorbar(T_values, time_total_median, yerr=time_total_std, fmt='o',
                  markersize=4.5, elinewidth=1.0, capsize=2,
                  color='black', ecolor='#888888', label='Median ± std')
@@ -86,23 +88,10 @@ def plot_latency_vs_T(data, output_dir):
     ax1.legend(frameon=False)
     ax1.set_xlim(left=min(T_values)*0.9, right=max(T_values)*1.05)
     
-    # Add system info
-    if data:
-        info = data[0]
-        fig1.text(0.5, 0.02, 
-                f"GPU: {info['gpu_name']} | PyTorch {info['pytorch_version']} | "
-                f"dtype: {info['dtype']} | Batch Size: {info['batch_size']}",
-                ha='center', fontsize=9, style='italic', color='#555555')
+    # Add value annotations
+    # Keep figure clean: avoid label clutter in academic style
     
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
-    output_path1 = Path(output_dir) / 'latency_total_vs_T.png'
-    plt.savefig(output_path1, bbox_inches='tight', facecolor='white', edgecolor='none')
-    print(f"  Saved: {output_path1}")
-    plt.close()
-    
-    # Plot 2: Time per Token vs T (standalone)
-    fig2, ax2 = plt.subplots(1, 1, figsize=(8, 6))
-    
+    # Plot 2: Time per Token vs T
     ax2.plot(T_values, time_per_token, 's-', linewidth=1.8, markersize=4.5,
              color='#A23B72')
     
@@ -112,58 +101,75 @@ def plot_latency_vs_T(data, output_dir):
     ax2.grid(True, linestyle='--', alpha=0.3)
     ax2.set_xlim(left=min(T_values)*0.9, right=max(T_values)*1.05)
     
-    # Add system info
+    # Add value annotations
+    # Avoid per-point annotations for a cleaner academic figure
+    
+    # Add system info as subtitle
     if data:
         info = data[0]
-        fig2.text(0.5, 0.02, 
-                f"GPU: {info['gpu_name']} | PyTorch {info['pytorch_version']} | "
-                f"dtype: {info['dtype']} | Batch Size: {info['batch_size']}",
-                ha='center', fontsize=9, style='italic', color='#555555')
+        fig.suptitle(f"GPU: {info['gpu_name']} | PyTorch {info['pytorch_version']} | "
+                    f"dtype: {info['dtype']} | Batch Size: {info['batch_size']}",
+                    fontsize=10, y=0.98, style='italic', color='#555555')
     
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
-    output_path2 = Path(output_dir) / 'latency_per_token_vs_T.png'
-    plt.savefig(output_path2, bbox_inches='tight', facecolor='white', edgecolor='none')
-    print(f"  Saved: {output_path2}")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    # Save plot
+    output_path = Path(output_dir) / 'latency_vs_T.png'
+    plt.savefig(output_path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {output_path}")
+    
     plt.close()
 
 
 def plot_vram_vs_T(data, output_dir):
     """
-    Plot VRAM usage vs T: relative growth from first T point.
+    Plot VRAM usage vs T benchmark results.
     """
     # Sort by T value
     data = sorted(data, key=lambda x: x['T'])
     
     T_values = [d['T'] for d in data]
     peak_memory_gb = [d['peak_memory_bytes'] / 1e9 for d in data]
+    peak_activation_gb = [d.get('peak_activation_bytes', 0) / 1e9 for d in data]
     
-    # Baseline subtract: use first T point as baseline
-    baseline_memory_gb = peak_memory_gb[0]
-    relative_memory_gb = [mem - baseline_memory_gb for mem in peak_memory_gb]
+    # Create figure
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.8))
     
-    # Create standalone figure
-    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    # Plot with filled area
+    # Left: raw peak memory (weights + activations)
+    ax1.plot(T_values, peak_memory_gb, 'o-', linewidth=1.8, markersize=4.5,
+             color='#F18F01')
+    ax1.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
+    ax1.set_ylabel('Peak GPU Memory (GB)', fontweight='bold')
+    ax1.set_title('Peak Memory vs T (Raw)', fontweight='bold', pad=12)
+    ax1.set_xlim(left=min(T_values)*0.9, right=max(T_values)*1.05)
+    ax1.set_ylim(bottom=0)
+
+    # Right: baseline-subtracted (activation-only) memory to highlight growth
+    ax2.plot(T_values, peak_activation_gb, 'o-', linewidth=1.8, markersize=4.5,
+             color='#2E86AB')
+    ax2.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
+    ax2.set_ylabel('Peak Activation Memory (GB)', fontweight='bold')
+    ax2.set_title('Peak Memory vs T (Activations only)', fontweight='bold', pad=12)
+    ax2.set_xlim(left=min(T_values)*0.9, right=max(T_values)*1.05)
+    ax2.set_ylim(bottom=0)
     
-    ax.plot(T_values, relative_memory_gb, 'o-', linewidth=1.8, markersize=4.5,
-            color='#2E86AB')
-    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
-    ax.set_ylabel('Additional Memory Usage (GB)', fontweight='bold')
-    ax.set_title('GPU Memory Growth vs Generation Length', fontweight='bold', pad=15)
-    ax.set_xlim(left=min(T_values)*0.9, right=max(T_values)*1.05)
-    ax.set_ylim(bottom=0)
-    ax.grid(True, linestyle='--', alpha=0.3)
-    
-    # Add system info
+    # Add GPU memory capacity line if available
     if data:
         total_vram_gb = data[0]['gpu_total_vram'] / 1e9
+        for ax in (ax1, ax2):
+            ax.axhline(y=total_vram_gb, color='#999999', linestyle='--', linewidth=1.2, 
+                       alpha=0.6, label=f'GPU Capacity: {total_vram_gb:.1f} GB')
+            ax.legend(frameon=False)
+
+        # Add system info
         info = data[0]
-        fig.text(0.5, 0.02,
+        fig.text(0.5, 0.96,
                  f"GPU: {info['gpu_name']} ({total_vram_gb:.1f} GB) | "
-                 f"dtype: {info['dtype']} | Batch Size: {info['batch_size']} | "
-                 f"Baseline (T={T_values[0]}): {baseline_memory_gb:.3f} GB",
-                 ha='center', fontsize=9, style='italic', color='#555555')
+                 f"dtype: {info['dtype']} | Batch Size: {info['batch_size']}",
+                 ha='center', fontsize=10, style='italic', color='#555555')
     
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
     
     # Save plot
     output_path = Path(output_dir) / 'vram_vs_T.png'
@@ -176,7 +182,7 @@ def plot_vram_vs_T(data, output_dir):
 def plot_per_phase_timing(data, output_dir):
     """
     Plot per-phase timing breakdown.
-    Creates separate bar and pie chart figures.
+    Shows both absolute times and percentage breakdown.
     """
     if not data:
         print("  No per-phase timing data found.")
@@ -213,64 +219,95 @@ def plot_per_phase_timing(data, output_dir):
     total_measured = sum(times)
     percentages = [100 * t / total_measured for t in times]
     
-    # Bar chart (standalone)
-    fig_bar, ax_bar = plt.subplots(figsize=(8, 6))
-    bars = ax_bar.bar(labels, times, color=colors, edgecolor='white', linewidth=1.5)
-    ax_bar.set_ylabel('Total Time (ms)', fontweight='bold')
-    ax_bar.set_title(f'Phase Timing Breakdown (T={T_star})', fontweight='bold', pad=15)
-    ax_bar.grid(True, axis='y', linestyle='--', alpha=0.3)
-    ax_bar.set_ylim(bottom=0, top=max(times) * 1.15)
-    ax_bar.tick_params(axis='x', rotation=15)
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     
+    # Plot 1: Absolute times (bar chart)
+    bars = ax1.bar(labels, times, color=colors, edgecolor='white', linewidth=2)
+    
+    ax1.set_ylabel('Total Time (ms)', fontweight='bold')
+    ax1.set_title(f'Absolute Time Breakdown (T={T_star} tokens)', fontweight='bold', pad=15)
+    ax1.grid(True, axis='y', linestyle='--', alpha=0.4)
+    ax1.set_ylim(bottom=0, top=max(times) * 1.15)
+    
+    # Add value annotations on bars
     for bar, time, pct in zip(bars, times, percentages):
         height = bar.get_height()
-        ax_bar.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{time:.1f} ms', ha='center', va='bottom', fontsize=9)
+        ax1.text(bar.get_x() + bar.get_width()/2., height,
+                f'{time:.1f} ms\n({pct:.1f}%)',
+                ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    # Add system info
-    info = record
-    fig_bar.text(0.5, 0.02,
-                f"GPU: {info['gpu_name']} | PyTorch {info['pytorch_version']} | "
-                f"dtype: {info['dtype']} | Total Time: {total_measured:.1f} ms",
-                ha='center', fontsize=9, style='italic', color='#555555')
+    # Rotate x labels if needed
+    ax1.tick_params(axis='x', rotation=15)
     
-    fig_bar.tight_layout(rect=[0, 0.04, 1, 1])
-    bars_path = Path(output_dir) / 'per_phase_breakdown_bar.png'
-    fig_bar.savefig(bars_path, bbox_inches='tight', facecolor='white', edgecolor='none')
-    print(f"  Saved: {bars_path}")
-    plt.close(fig_bar)
-
-    # Pie chart (standalone) - hide labels <1%
-    fig_pie, ax_pie = plt.subplots(figsize=(8, 6))
+    # Plot 2: Percentage breakdown (pie chart)
     explode = [0.05] * len(phases)
+    wedges, texts, autotexts = ax2.pie(percentages, labels=labels, colors=colors,
+                                        autopct='%1.1f%%', startangle=90,
+                                        explode=explode,
+                                        wedgeprops=dict(edgecolor='white', linewidth=2))
     
-    # Custom autopct to hide small percentages
-    def autopct_format(pct):
-        return f'{pct:.1f}%' if pct >= 1.0 else ''
-    
-    wedges, texts, autotexts = ax_pie.pie(percentages, labels=labels, colors=colors,
-                                          autopct=autopct_format, startangle=90,
-                                          explode=explode,
-                                          wedgeprops=dict(edgecolor='white', linewidth=1.5))
-    
+    # Make percentage text bold and white
     for autotext in autotexts:
         autotext.set_color('white')
         autotext.set_fontsize(10)
         autotext.set_fontweight('bold')
     
-    ax_pie.set_title(f'Phase Time Distribution (T={T_star})', fontweight='bold', pad=15)
+    ax2.set_title(f'Relative Time Distribution (T={T_star} tokens)', 
+                 fontweight='bold', pad=15)
     
     # Add system info
-    fig_pie.text(0.5, 0.02,
-                f"GPU: {info['gpu_name']} | PyTorch {info['pytorch_version']} | "
-                f"dtype: {info['dtype']} | Total Time: {total_measured:.1f} ms",
-                ha='center', fontsize=9, style='italic', color='#555555')
+    if data:
+        info = record
+        fig.suptitle(f"GPU: {info['gpu_name']} | PyTorch {info['pytorch_version']} | "
+                    f"dtype: {info['dtype']} | Total Time: {total_measured:.1f} ms",
+                    fontsize=10, y=0.98, style='italic', color='#555555')
     
-    fig_pie.tight_layout(rect=[0, 0.04, 1, 1])
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    # Save plot
+    # Save separate figures as requested
+    bars_path = Path(output_dir) / 'per_phase_breakdown_bar.png'
     pies_path = Path(output_dir) / 'per_phase_breakdown_pie.png'
+
+    # Bar-only figure
+    fig_bar, ax_bar = plt.subplots(figsize=(7, 4.8))
+    bars = ax_bar.bar(labels, times, color=colors, edgecolor='white', linewidth=1.5)
+    ax_bar.set_ylabel('Total Time (ms)', fontweight='bold')
+    ax_bar.set_title(f'Phase Timing Breakdown (T={T_star})', fontweight='bold', pad=12)
+    ax_bar.grid(True, axis='y', linestyle='--', alpha=0.3)
+    ax_bar.set_ylim(bottom=0, top=max(times) * 1.15)
+    ax_bar.tick_params(axis='x', rotation=15)
+    for bar, time, pct in zip(bars, times, percentages):
+        height = bar.get_height()
+        ax_bar.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{time:.1f} ms', ha='center', va='bottom', fontsize=9)
+    fig_bar.tight_layout()
+    fig_bar.savefig(bars_path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.close(fig_bar)
+
+    # Pie-only figure
+    fig_pie, ax_pie = plt.subplots(figsize=(7, 4.8))
+    explode = [0.05] * len(phases)
+    wedges, texts, autotexts = ax_pie.pie(percentages, labels=labels, colors=colors,
+                                          autopct='%1.1f%%', startangle=90,
+                                          explode=explode,
+                                          wedgeprops=dict(edgecolor='white', linewidth=1.5))
+    for autotext in autotexts:
+        autotext.set_color('white')
+        autotext.set_fontsize(10)
+        autotext.set_fontweight('bold')
+    ax_pie.set_title(f'Phase Time Share (T={T_star})', fontweight='bold', pad=12)
+    fig_pie.tight_layout()
     fig_pie.savefig(pies_path, bbox_inches='tight', facecolor='white', edgecolor='none')
-    print(f"  Saved: {pies_path}")
     plt.close(fig_pie)
+
+    # Also save the combined figure for convenience
+    output_path = Path(output_dir) / 'per_phase_timing.png'
+    plt.savefig(output_path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {output_path}")
+    
+    plt.close()
 
 
 def main():
@@ -308,7 +345,7 @@ def main():
     
     # Generate plots for each benchmark type
     if 'latency_vs_T' in results:
-        print("Generating Latency vs T plots...")
+        print("Generating Latency vs T plot...")
         plot_latency_vs_T(results['latency_vs_T'], output_dir)
     
     if 'vram_vs_T' in results:
@@ -316,7 +353,7 @@ def main():
         plot_vram_vs_T(results['vram_vs_T'], output_dir)
     
     if 'per_phase_timing' in results:
-        print("Generating Per-phase Timing plots...")
+        print("Generating Per-phase Timing plot...")
         plot_per_phase_timing(results['per_phase_timing'], output_dir)
     
     print()
