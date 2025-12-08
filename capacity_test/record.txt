@@ -1,0 +1,57 @@
+Before:
+python bench_capacity_training.py 
+Initializing GPT model (n_layer=12, n_embd=768)...
+number of parameters: 123.59M
+Model initialized. Starting capacity stress test...
+----------------------------------------
+Batch Size      | Status     | Memory (Allocated)
+----------------------------------------
+1               | OK         | 1.05 GB
+2               | OK         | 1.14 GB
+3               | OK         | 1.24 GB
+4               | OK         | 1.34 GB
+5               | OK         | 1.43 GB
+6               | OK         | 1.52 GB
+7               | OK         | 1.62 GB
+8               | OK         | 1.72 GB
+9               | OK         | 1.81 GB
+10              | OK         | 1.91 GB
+11              | OK         | 2.00 GB
+12              | OK         | 2.10 GB
+13              | OK         | 2.20 GB
+14              | OK         | 2.29 GB
+15              | OK         | 2.39 GB
+16              | OK         | 2.48 GB
+17              | OK         | 2.58 GB
+18              | OK         | 2.68 GB
+19              | OK         | 2.77 GB
+20              | OK         | 2.87 GB
+21              | OK         | 2.96 GB
+22              | OK         | 3.06 GB
+23              | OK         | 3.15 GB
+24              | OK         | 3.25 GB
+----------------------------------------
+!!! OOM (Out Of Memory) reached at Batch Size: 25 !!!
+Maximum stable Batch Size: 24
+
+
+
+python ./bench_capacity_inference.py 
+Initializing Model on cuda...
+number of parameters: 123.69M
+Starting Inference Capacity Stress Test (Powers of 2)...
+--------------------------------------------------
+Testing Batch Size 1... [OK] | Memory: 0.47 GB
+Testing Batch Size 2... [OK] | Memory: 0.47 GB
+Testing Batch Size 4... [OK] | Memory: 0.47 GB
+Testing Batch Size 8... [OK] | Memory: 0.47 GB
+Testing Batch Size 16... [OK] | Memory: 0.47 GB
+Testing Batch Size 32... [OK] | Memory: 0.47 GB
+Testing Batch Size 64... [OK] | Memory: 0.47 GB
+Testing Batch Size 128... [OK] | Memory: 0.47 GB
+Testing Batch Size 256... [OK] | Memory: 0.47 GB
+Testing Batch Size 512... [OK] | Memory: 0.47 GB
+Testing Batch Size 1024...
+[CRASH] OOM reached at Batch Size: 1024!
+--------------------------------------------------
+Final Max Capacity (Inference): Batch Size 512
