@@ -49,7 +49,21 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, layer_past=None, use_cache=False):
+        """
+        Forward pass with optional KV-cache support.
+
+        Args:
+            x: Input tensor (B, T, C)
+               - Training: T = sequence length
+               - Cached inference: T = 1 (new token only)
+            layer_past: Optional tuple (past_key, past_value) each (B, nh, T_past, hs)
+            use_cache: If True, return updated KV cache
+
+        Returns:
+            y: Output tensor (B, T, C)
+            present: Tuple (key, value) if use_cache=True, else None
+        """
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -58,14 +72,39 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        # concatenate with past KV if available
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            k = torch.cat([past_key, k], dim=2)   # (B, nh, T_past + T, hs)
+            v = torch.cat([past_value, v], dim=2) # (B, nh, T_past + T, hs)
+
+        # prepare cache to return
+        present = (k, v) if use_cache else None
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # when using cache: Q (new tokens) attends to all K (past + new)
+            # no causal mask needed since all K positions are valid for Q
+            if layer_past is not None:
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0,
+                    is_causal=False  # Q attends to all past positions
+                )
+            else:
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0,
+                    is_causal=True
+                )
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if layer_past is None:
+                # apply causal mask only during prefill (no cache)
+                T_total = k.size(2)
+                att = att.masked_fill(self.bias[:, :, :T_total, :T_total] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -73,7 +112,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, present
 
 class MLP(nn.Module):
 
