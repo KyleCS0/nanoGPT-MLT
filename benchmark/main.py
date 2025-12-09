@@ -132,7 +132,7 @@ def decode_loop(model, prompt, T):
         # if the sequence context is growing too long we must crop it at block_size
         idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
         # forward the model to get the logits for the index in the sequence
-        logits, _ = model(idx_cond)
+        logits, _, _ = model(idx_cond)
         # pluck the logits at the final step
         logits = logits[:, -1, :]
         # apply softmax to convert logits to (normalized) probabilities
