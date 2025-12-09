@@ -139,10 +139,23 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, layer_past=None, use_cache=False):
+        """
+        Forward pass with optional KV-cache support.
+
+        Args:
+            x: Input tensor (B, T, C)
+            layer_past: Optional KV cache for this block's attention layer
+            use_cache: If True, return updated KV cache
+
+        Returns:
+            x: Output tensor (B, T, C)
+            present: KV cache tuple if use_cache=True, else None
+        """
+        attn_out, present = self.attn(self.ln_1(x), layer_past=layer_past, use_cache=use_cache)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, present
 
 @dataclass
 class GPTConfig:
