@@ -388,28 +388,66 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+
+        Args:
+            idx: Input token indices (B, T)
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature (1.0 = no change)
+            top_k: If set, only sample from top k tokens
+            use_cache: If True, use KV-cache for efficient generation (default: True)
+
+        Returns:
+            idx: Generated sequence (B, T + max_new_tokens)
         """
+        past_key_values = None
+
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
+            # Determine what to feed the model
+            if use_cache and past_key_values is not None:
+                # Cached generation: only feed the last token
+                idx_cond = idx[:, -1:]
+            else:
+                # First iteration or non-cached: feed full sequence (up to block_size)
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+
+            # Forward pass
+            logits, _, past_key_values = self(
+                idx_cond,
+                past_key_values=past_key_values if use_cache else None,
+                use_cache=use_cache
+            )
+
+            # Handle cache overflow: if we exceed block_size, trim the cache
+            if use_cache and past_key_values is not None:
+                cache_len = past_key_values[0][0].size(2)
+                if cache_len >= self.config.block_size:
+                    # Trim cache to block_size - 1 to make room for next token
+                    past_key_values = [
+                        (k[:, :, -(self.config.block_size - 1):, :],
+                         v[:, :, -(self.config.block_size - 1):, :])
+                        for k, v in past_key_values
+                    ]
+
+            # Pluck the logits at the final step and scale by temperature
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+
+            # Optionally crop to top k
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+
+            # Apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
+
+            # Sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
+
+            # Append to sequence
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
