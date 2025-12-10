@@ -250,7 +250,8 @@ class GPT(nn.Module):
         # Process through transformer blocks, collecting KV caches
         present_key_values = [] if use_cache else None
         for i, block in enumerate(self.transformer.h):
-            layer_past = past_key_values[i] if past_key_values is not None else None
+            cache_idx = i if i % 2 == 0 else i - 1 # Cross-layer sharing for inference-time hack
+            layer_past = past_key_values[cache_idx] if past_key_values is not None else None
             x, present = block(x, layer_past=layer_past, use_cache=use_cache)
             if use_cache:
                 present_key_values.append(present)
