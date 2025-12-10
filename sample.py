@@ -21,6 +21,7 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 cross_layer_sharing = False # Gating the cross-layer sharing hack
 compile = False # use PyTorch 2.0 to compile the model to be faster
+kv_cache_quant = False # Toggle INT8 quantization for KV cache
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
@@ -38,6 +39,7 @@ if init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
+    gptconf.kv_cache_quant = kv_cache_quant # override kv_cache_quant from checkpoint
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
@@ -47,7 +49,7 @@ if init_from == 'resume':
     model.load_state_dict(state_dict)
 elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+    model = GPT.from_pretrained(init_from, dict(dropout=0.0), override_kv_cache_quant=kv_cache_quant)
 
 model.eval()
 model.to(device)

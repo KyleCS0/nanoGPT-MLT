@@ -41,6 +41,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.config = config
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -74,12 +75,29 @@ class CausalSelfAttention(nn.Module):
 
         # concatenate with past KV if available
         if layer_past is not None:
-            past_key, past_value = layer_past
+            if self.config.kv_cache_quant:
+                # Dequantize
+                (past_key_q, past_key_s), (past_value_q, past_value_s) = layer_past
+                past_key = past_key_q.to(torch.float16) * past_key_s
+                past_value = past_value_q.to(torch.float16) * past_value_s
+            else:
+                past_key, past_value = layer_past
             k = torch.cat([past_key, k], dim=2)   # (B, nh, T_past + T, hs)
             v = torch.cat([past_value, v], dim=2) # (B, nh, T_past + T, hs)
 
         # prepare cache to return
-        present = (k, v) if use_cache else None
+        if use_cache:
+            if self.config.kv_cache_quant:
+                # Quantize
+                k_scale = k.abs().max(dim=-1, keepdim=True).values / 127.0
+                k_quant = (k / k_scale).round().to(torch.int8)
+                v_scale = v.abs().max(dim=-1, keepdim=True).values / 127.0
+                v_quant = (v / v_scale).round().to(torch.int8)
+                present = ((k_quant, k_scale), (v_quant, v_scale))
+            else:
+                present = (k, v)
+        else:
+            present = None
 
         # causal self-attention
         if self.flash:
@@ -158,6 +176,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     cross_layer_sharing: bool = False # Toggles the cross-layer sharing hack
+    kv_cache_quant: bool = False # Toggles INT8 quantization for KV cache
 
 class GPT(nn.Module):
 
@@ -237,7 +256,10 @@ class GPT(nn.Module):
         # Calculate position offset from cache
         past_length = 0
         if past_key_values is not None:
-            past_length = past_key_values[0][0].size(2)  # (B, nh, T_past, hs)
+            if self.config.kv_cache_quant:
+                past_length = past_key_values[0][0][0].size(2)  # (B, nh, T_past, hs)
+            else:
+                past_length = past_key_values[0][0].size(2)  # (B, nh, T_past, hs)
 
         # Validate sequence length
         total_length = past_length + t
@@ -289,7 +311,7 @@ class GPT(nn.Module):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
+    def from_pretrained(cls, model_type, override_args=None, override_kv_cache_quant=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
@@ -312,6 +334,10 @@ class GPT(nn.Module):
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
+        # override kv_cache_quant if desired
+        if override_kv_cache_quant is not None:
+            print(f"overriding kv_cache_quant to {override_kv_cache_quant}")
+            config_args['kv_cache_quant'] = override_kv_cache_quant
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
@@ -426,14 +452,24 @@ class GPT(nn.Module):
 
             # Handle cache overflow: if we exceed block_size, trim the cache
             if use_cache and past_key_values is not None:
-                cache_len = past_key_values[0][0].size(2)
+                if self.config.kv_cache_quant:
+                    cache_len = past_key_values[0][0][0].size(2)
+                else:
+                    cache_len = past_key_values[0][0].size(2)
                 if cache_len >= self.config.block_size:
                     # Trim cache to block_size - 1 to make room for next token
-                    past_key_values = [
-                        (k[:, :, -(self.config.block_size - 1):, :],
-                         v[:, :, -(self.config.block_size - 1):, :])
-                        for k, v in past_key_values
-                    ]
+                    if self.config.kv_cache_quant:
+                        past_key_values = [
+                            ((k[0][:, :, -(self.config.block_size - 1):, :], k[1]),
+                             (v[0][:, :, -(self.config.block_size - 1):, :], v[1]))
+                            for k, v in past_key_values
+                        ]
+                    else:
+                        past_key_values = [
+                            (k[:, :, -(self.config.block_size - 1):, :],
+                             v[:, :, -(self.config.block_size - 1):, :])
+                            for k, v in past_key_values
+                        ]
 
             # Pluck the logits at the final step and scale by temperature
             logits = logits[:, -1, :] / temperature
