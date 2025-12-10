@@ -81,33 +81,24 @@ class CausalSelfAttention(nn.Module):
         # prepare cache to return
         present = (k, v) if use_cache else None
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # causal self-attention
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            # when using cache: Q (new tokens) attends to all K (past + new)
-            # no causal mask needed since all K positions are valid for Q
-            if layer_past is not None:
-                y = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v, attn_mask=None,
-                    dropout_p=self.dropout if self.training else 0,
-                    is_causal=False  # Q attends to all past positions
-                )
-            else:
-                y = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v, attn_mask=None,
-                    dropout_p=self.dropout if self.training else 0,
-                    is_causal=True
-                )
+            # Flash Attention: is_causal=True for no cache, False for single-token cached generation
+            assert layer_past is None or T == 1, "Cached generation only supports single-token input"
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=(layer_past is None)
+            )
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            if layer_past is None:
-                # apply causal mask only during prefill (no cache)
-                T_total = k.size(2)
-                att = att.masked_fill(self.bias[:, :, :T_total, :T_total] == 0, float('-inf'))
+            T_total = k.size(2)
+            T_past = T_total - T
+            att = att.masked_fill(self.bias[:, :, T_past:T_total, :T_total] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
