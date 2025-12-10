@@ -49,7 +49,21 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, layer_past=None, use_cache=False):
+        """
+        Forward pass with optional KV-cache support.
+
+        Args:
+            x: Input tensor (B, T, C)
+               - Training: T = sequence length
+               - Cached inference: T = 1 (new token only)
+            layer_past: Optional tuple (past_key, past_value) each (B, nh, T_past, hs)
+            use_cache: If True, return updated KV cache
+
+        Returns:
+            y: Output tensor (B, T, C)
+            present: Tuple (key, value) if use_cache=True, else None
+        """
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -58,22 +72,38 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # concatenate with past KV if available
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            k = torch.cat([past_key, k], dim=2)   # (B, nh, T_past + T, hs)
+            v = torch.cat([past_value, v], dim=2) # (B, nh, T_past + T, hs)
+
+        # prepare cache to return
+        present = (k, v) if use_cache else None
+
+        # causal self-attention
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # Flash Attention: is_causal=True for no cache, False for single-token cached generation
+            assert layer_past is None or T == 1, "Cached generation only supports single-token input"
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=(layer_past is None)
+            )
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            T_total = k.size(2)
+            T_past = T_total - T
+            att = att.masked_fill(self.bias[:, :, T_past:T_total, :T_total] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, present
 
 class MLP(nn.Module):
 
@@ -100,10 +130,23 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, layer_past=None, use_cache=False):
+        """
+        Forward pass with optional KV-cache support.
+
+        Args:
+            x: Input tensor (B, T, C)
+            layer_past: Optional KV cache for this block's attention layer
+            use_cache: If True, return updated KV cache
+
+        Returns:
+            x: Output tensor (B, T, C)
+            present: KV cache tuple if use_cache=True, else None
+        """
+        attn_out, present = self.attn(self.ln_1(x), layer_past=layer_past, use_cache=use_cache)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, present
 
 @dataclass
 class GPTConfig:
@@ -167,18 +210,51 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, past_key_values=None, use_cache=False):
+        """
+        Forward pass with optional KV-cache support.
+
+        Args:
+            idx: Input token indices (B, T)
+            targets: Optional target indices for loss computation (B, T)
+            past_key_values: Optional list of KV caches, one per layer
+                            Each element is (key, value) tuple
+            use_cache: If True, return updated KV caches
+
+        Returns:
+            logits: Output logits (B, T, vocab_size) or (B, 1, vocab_size) if no targets
+            loss: Cross-entropy loss if targets provided, else None
+            present_key_values: List of KV caches if use_cache=True, else None
+        """
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # Calculate position offset from cache
+        past_length = 0
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].size(2)  # (B, nh, T_past, hs)
+
+        # Validate sequence length
+        total_length = past_length + t
+        assert total_length <= self.config.block_size, \
+            f"Cannot forward sequence of length {total_length}, block size is only {self.config.block_size}"
+
+        # Position indices: offset by past_length when using cache
+        pos = torch.arange(past_length, past_length + t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+
+        # Process through transformer blocks, collecting KV caches
+        present_key_values = [] if use_cache else None
+        for i, block in enumerate(self.transformer.h):
+            layer_past = past_key_values[i] if past_key_values is not None else None
+            x, present = block(x, layer_past=layer_past, use_cache=use_cache)
+            if use_cache:
+                present_key_values.append(present)
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -190,7 +266,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, present_key_values
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -303,28 +379,66 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+
+        Args:
+            idx: Input token indices (B, T)
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature (1.0 = no change)
+            top_k: If set, only sample from top k tokens
+            use_cache: If True, use KV-cache for efficient generation (default: True)
+
+        Returns:
+            idx: Generated sequence (B, T + max_new_tokens)
         """
+        past_key_values = None
+
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
+            # Determine what to feed the model
+            if use_cache and past_key_values is not None:
+                # Cached generation: only feed the last token
+                idx_cond = idx[:, -1:]
+            else:
+                # First iteration or non-cached: feed full sequence (up to block_size)
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+
+            # Forward pass
+            logits, _, past_key_values = self(
+                idx_cond,
+                past_key_values=past_key_values if use_cache else None,
+                use_cache=use_cache
+            )
+
+            # Handle cache overflow: if we exceed block_size, trim the cache
+            if use_cache and past_key_values is not None:
+                cache_len = past_key_values[0][0].size(2)
+                if cache_len >= self.config.block_size:
+                    # Trim cache to block_size - 1 to make room for next token
+                    past_key_values = [
+                        (k[:, :, -(self.config.block_size - 1):, :],
+                         v[:, :, -(self.config.block_size - 1):, :])
+                        for k, v in past_key_values
+                    ]
+
+            # Pluck the logits at the final step and scale by temperature
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+
+            # Optionally crop to top k
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+
+            # Apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
+
+            # Sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
+
+            # Append to sequence
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
