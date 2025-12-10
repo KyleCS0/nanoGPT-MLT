@@ -157,6 +157,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    cross_layer_sharing: bool = False # Toggles the cross-layer sharing hack
 
 class GPT(nn.Module):
 
@@ -210,7 +211,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, past_key_values=None, use_cache=False):
+    def forward(self, idx, targets=None, past_key_values=None, use_cache=False, cross_layer_sharing=None):
         """
         Forward pass with optional KV-cache support.
 
@@ -220,6 +221,7 @@ class GPT(nn.Module):
             past_key_values: Optional list of KV caches, one per layer
                             Each element is (key, value) tuple
             use_cache: If True, return updated KV caches
+            cross_layer_sharing: If True, enable cross-layer sharing hack
 
         Returns:
             logits: Output logits (B, T, vocab_size) or (B, 1, vocab_size) if no targets
@@ -229,6 +231,9 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
 
+        # Determine if we are using cross-layer sharing
+        use_cls = cross_layer_sharing if cross_layer_sharing is not None else self.config.cross_layer_sharing
+        
         # Calculate position offset from cache
         past_length = 0
         if past_key_values is not None:
@@ -250,8 +255,11 @@ class GPT(nn.Module):
         # Process through transformer blocks, collecting KV caches
         present_key_values = [] if use_cache else None
         for i, block in enumerate(self.transformer.h):
-            cache_idx = i if i % 2 == 0 else i - 1 # Cross-layer sharing for inference-time hack
-            layer_past = past_key_values[cache_idx] if past_key_values is not None else None
+            if use_cls:
+                cache_idx = i if i % 2 == 0 else i - 1 # Cross-layer sharing for inference-time hack
+                layer_past = past_key_values[cache_idx] if past_key_values is not None else None
+            else:
+                layer_past = past_key_values[i] if past_key_values is not None else None
             x, present = block(x, layer_past=layer_past, use_cache=use_cache)
             if use_cache:
                 present_key_values.append(present)
@@ -380,7 +388,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True, cross_layer_sharing=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -392,6 +400,7 @@ class GPT(nn.Module):
             temperature: Sampling temperature (1.0 = no change)
             top_k: If set, only sample from top k tokens
             use_cache: If True, use KV-cache for efficient generation (default: True)
+            cross_layer_sharing: If True, enable cross-layer sharing hack
 
         Returns:
             idx: Generated sequence (B, T + max_new_tokens)
@@ -411,7 +420,8 @@ class GPT(nn.Module):
             logits, _, past_key_values = self(
                 idx_cond,
                 past_key_values=past_key_values if use_cache else None,
-                use_cache=use_cache
+                use_cache=use_cache,
+                cross_layer_sharing=cross_layer_sharing
             )
 
             # Handle cache overflow: if we exceed block_size, trim the cache
