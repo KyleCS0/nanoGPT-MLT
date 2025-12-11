@@ -1,48 +1,107 @@
-# Roofline Analysis Benchmark
+# Roofline Analysis: KV Cache Effect
 
-This directory contains tools to perform a Roofline Analysis on the nanoGPT model, specifically comparing the **Standard Attention (V0)** mechanism against the **KV-Cache Optimized (V1)** mechanism.
+This benchmark evaluates the effect of KV caching on transformer inference by comparing compute vs memory behavior on the roofline model.
 
-## Overview
-The goal is to physically demonstrate that:
-*   **V0 (No Cache)** is **Compute Bound** (or moves towards it) due to redundant $O(T^2)$ computations.
-*   **V1 (KV Cache)** is **Memory Bound** because it minimizes compute to $O(T)$, leaving memory bandwidth as the bottleneck.
+## Goal
+
+Demonstrate that:
+1. **Prefill** (processing prompt tokens) is similar with/without cache
+2. **Decode** (generating new tokens with cache) becomes **memory-bound**
+
+This motivates KV cache optimizations: sharing, quantization, compression.
+
+## Three-Stage Profiling
+
+| Stage | Description | Expected Behavior |
+|-------|-------------|-------------------|
+| **V0 Prefill** | Forward pass on P tokens, no cache | Baseline compute |
+| **V1 Prefill** | Forward pass on P tokens, building cache | Similar to V0 + cache writes |
+| **V1 Decode** | Single token decode using cached K/V | Low FLOPs, memory-bound |
 
 ## Files
-*   `profile_decode_step.py`: The PyTorch script that runs the specific decode step for profiling.
-*   `run_ncu.sh`: Shell script to run NVIDIA Nsight Compute (`ncu`) with correct permissions and settings.
-*   `parse_ncu_results.py`: Parsers the raw CSV output from `ncu` to extract FLOPs and DRAM bytes.
-*   `plot_roofline.py`: Generates the standard Roofline visualization.
-*   `analyze_results.sh`: End-to-end script that parses reports and runs the plotter.
+
+* `profile_decode_step.py` - PyTorch profiling script (three versions)
+* `run_ncu.sh` - Runs NCU profiler for all three stages
+* `parse_ncu_results.py` - Extracts metrics from NCU reports
+* `plot_roofline.py` - Generates publication-quality roofline visualization
+* `analyze_results.sh` - End-to-end parsing and plotting
+
+## Plot Features
+
+The roofline plot includes:
+- **Publication-quality styling**: 300 DPI, serif fonts, professional grid
+- **Efficiency metrics**: Shows % of peak performance and bottleneck type
+- **Hardware info footer**: GPU, dtype, batch size, sequence length
+- **Multiple formats**: PNG + PDF output for paper inclusion
 
 ## Usage
 
-### 1. Run Profiling
-**Requires `sudo`** to access GPU performance counters.
-Adjust parameters (Model, Batch Size, Sequence Length) in `run_ncu.sh`.
+### 1. Run Profiling (requires sudo)
 
 ```bash
+# Default: P=512 tokens, batch=1, gpt2-medium
 sudo bash benchmark/roofline/run_ncu.sh
+
+# Custom parameters
+sudo bash benchmark/roofline/run_ncu.sh --P 256 --batch 1 --model gpt2
 ```
-*Outputs: `ncu_reports/*.ncu-rep` (Massive binary files)*
+
+**Options:**
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--P` | 512 | Prompt length (prefill tokens) |
+| `--batch` | 1 | Batch size |
+| `--model` | gpt2-medium | Model variant |
+| `--dtype` | float16 | Data type |
 
 ### 2. Analyze & Plot
-Parses the reports and generates `roofline.png`.
-Adjust `BATCH_SIZE` and `T` in `analyze_results.sh` to match your run.
 
 ```bash
+# Must match profiling parameters
 bash benchmark/roofline/analyze_results.sh
+
+# Or with custom parameters
+bash benchmark/roofline/analyze_results.sh --P 256 --batch 1 --model gpt2
 ```
-*Outputs: `benchmark/roofline/roofline.png`, `metrics/*.json`*
 
-## Version Control Guidelines
+**Output:** `benchmark/roofline/roofline.png` and `benchmark/roofline/roofline.pdf`
 
-### ✅ What to Commit
-*   All Python scripts (`*.py`)
-*   All Shell scripts (`*.sh`)
-*   This `README.md`
-*   (Optional) `roofline.png` if you want to snapshot the current state.
+### Plot Options
 
-### ❌ What NOT to Commit
-*   **`ncu_reports/*.ncu-rep`**: These files are **HUGE** (100MB - 1GB+). Do not add them to git.
-*   `metrics/*.json`: Intermediate data files.
-*   `__pycache__`
+`plot_roofline.py` supports additional options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--gpu` | A6000 | GPU model: A6000, A100-40GB, A100-80GB, H100-80GB |
+| `--dtype` | float16 | Data type for peak FLOPS: float16, float32, bfloat16 |
+| `--model` | None | Model name for plot title |
+| `--batch-size` | None | Batch size for footer |
+| `--seq-length` | None | Sequence length for footer |
+| `--formats` | png pdf | Output formats: png, pdf, svg |
+
+**Example:**
+```bash
+python benchmark/roofline/plot_roofline.py \
+    --v0_prefill metrics/v0.json \
+    --v1_decode metrics/v1.json \
+    --gpu A6000 --model gpt2-medium --formats png pdf
+```
+
+## Expected Results
+
+```
+V0 Prefill:  High FLOPs, moderate AI  →  Closer to compute-bound
+V1 Prefill:  Similar to V0            →  Cache write overhead only
+V1 Decode:   Low FLOPs, low AI        →  Memory-bound (key insight!)
+```
+
+The decode step being memory-bound means:
+- Performance limited by KV cache bandwidth
+- Future optimizations should target memory efficiency
+- Cross-layer sharing, quantization become valuable
+
+## Version Control
+
+**Commit:** `*.py`, `*.sh`, `README.md`, `roofline.png` (optional)
+
+**Do NOT commit:** `ncu_reports/*.ncu-rep` (100MB+ each), `*_metrics.json`

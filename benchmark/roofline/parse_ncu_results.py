@@ -37,7 +37,8 @@ def parse_ncu_report(report_path):
         'fadd': 0.0,
         'fmul': 0.0,
         'ffma': 0.0,
-        'time_ns': 0.0
+        'time_ns': 0.0,
+        'kernel_count': 0
     }
 
     # Parse CSV output
@@ -71,13 +72,16 @@ def parse_ncu_report(report_path):
                 v = row.get(key, '0')
                 return float(v) if v else 0.0
 
-            # DRAM Bytes: Unit is Mbyte
+            # DRAM Bytes: NCU CSV reports in Mbyte (scaled), convert to bytes
             d_read = get_val('dram__bytes_read.sum')
             d_write = get_val('dram__bytes_write.sum')
-            metrics['dram_bytes'] += (d_read + d_write) * 1_000_000 # Convert MB to Bytes
+            metrics['dram_bytes'] += (d_read + d_write) * 1e6
 
-            # Extract Time: Unit is us
-            metrics['time_ns'] += get_val('gpu__time_duration.sum') * 1_000 # Convert us to ns
+            # Time: NCU CSV header says "ms" but values are in microseconds
+            # 12015 µs = 12.015 ms (reasonable for batch=1 forward pass)
+            kernel_time_us = get_val('gpu__time_duration.sum')
+            metrics['time_ns'] += kernel_time_us * 1e3  # µs → ns
+            metrics['kernel_count'] += 1
 
             # Extract FLOPs (Derived from SMSP rates * elapsed cycles)
             # Rate is "inst / cycle" (per device elapsed cycle)
@@ -116,12 +120,13 @@ def main():
     metrics = parse_ncu_report(args.report)
 
     print(f"Report: {args.report}")
+    print(f"  Kernels profiled: {metrics.get('kernel_count', 0)}")
     print(f"  DRAM Bytes: {metrics.get('dram_bytes', 0):,.0f}")
     print(f"  Total FLOPs: {metrics.get('total_flops', 0):,.0f}")
     print(f"    (FADD: {metrics.get('fadd',0):,.0f}, FMUL: {metrics.get('fmul',0):,.0f}, FFMA: {metrics.get('ffma',0):,.0f})")
-    print(f"  GPU Time (ns): {metrics.get('time_ns', 0):,.0f}")
+    print(f"  GPU Time: {metrics.get('time_ns', 0)/1e6:,.2f} ms ({metrics.get('time_ns', 0):,.0f} ns)")
     print(f"  Arithmetic Intensity: {metrics.get('arithmetic_intensity', 0):.2f} FLOPs/Byte")
-    print(f"  Achieved FLOP/s: {metrics.get('achieved_flops', 0):.2e}")
+    print(f"  Achieved TFLOP/s: {metrics.get('achieved_flops', 0)/1e12:.2f}")
 
     if args.output:
         with open(args.output, 'w') as f:
