@@ -12,3 +12,4 @@ env/
 venv/
 local_*
 claude.md
+benchmark/roofline/ncu_reports/*.ncu-rep
