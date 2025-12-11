@@ -33,6 +33,7 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn_q = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -41,6 +42,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.config = config
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -49,7 +51,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, layer_past=None, use_cache=False):
+    def forward(self, x, layer_past=None, use_cache=False, is_cache_owner=True):
         """
         Forward pass with optional KV-cache support.
 
@@ -59,6 +61,7 @@ class CausalSelfAttention(nn.Module):
                - Cached inference: T = 1 (new token only)
             layer_past: Optional tuple (past_key, past_value) each (B, nh, T_past, hs)
             use_cache: If True, return updated KV cache
+            is_cache_owner: If True, this layer is responsible for quantizing the cache
 
         Returns:
             y: Output tensor (B, T, C)
@@ -66,20 +69,55 @@ class CausalSelfAttention(nn.Module):
         """
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # In cross-layer sharing, borrower layers (is_cache_owner=False) with a valid cache
+        # should only compute Q and reuse K,V from the cache owner.
+        can_borrow = self.config.cross_layer_sharing and not is_cache_owner and layer_past is not None
+
+        if can_borrow:
+            # Borrower layer: compute Q only, K and V will be taken from cache
+            q = self.c_attn_q(x)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            k, v = None, None
+        else:
+            # Owner layer or borrower without cache: compute Q, K, V
+            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # concatenate with past KV if available
         if layer_past is not None:
-            past_key, past_value = layer_past
-            k = torch.cat([past_key, k], dim=2)   # (B, nh, T_past + T, hs)
-            v = torch.cat([past_value, v], dim=2) # (B, nh, T_past + T, hs)
+            if self.config.kv_cache_quant:
+                # Dequantize
+                (past_key_q, past_key_s), (past_value_q, past_value_s) = layer_past
+                past_key = past_key_q.to(q.dtype) * past_key_s
+                past_value = past_value_q.to(q.dtype) * past_value_s
+            else:
+                past_key, past_value = layer_past
+            
+            if can_borrow:
+                # Borrower uses cache owner's K,V directly
+                k, v = past_key, past_value
+            else:
+                # Owner concatenates new K,V with past
+                k = torch.cat([past_key, k], dim=2)   # (B, nh, T_past + T, hs)
+                v = torch.cat([past_value, v], dim=2) # (B, nh, T_past + T, hs)
 
         # prepare cache to return
-        present = (k, v) if use_cache else None
+        if use_cache:
+            # if cross-layer sharing is on, only owners should quantize and return a cache
+            # but we compute it here and let the GPT model decide whether to store it
+            if self.config.kv_cache_quant and is_cache_owner:
+                # Quantize
+                k_scale = k.abs().max(dim=-1, keepdim=True).values / 127.0
+                k_quant = (k / k_scale).round().to(torch.int8)
+                v_scale = v.abs().max(dim=-1, keepdim=True).values / 127.0
+                v_quant = (v / v_scale).round().to(torch.int8)
+                present = ((k_quant, k_scale), (v_quant, v_scale))
+            else:
+                present = (k, v)
+        else:
+            present = None
 
         # causal self-attention
         if self.flash:
@@ -130,7 +168,7 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, layer_past=None, use_cache=False):
+    def forward(self, x, layer_past=None, use_cache=False, is_cache_owner=True):
         """
         Forward pass with optional KV-cache support.
 
@@ -138,12 +176,13 @@ class Block(nn.Module):
             x: Input tensor (B, T, C)
             layer_past: Optional KV cache for this block's attention layer
             use_cache: If True, return updated KV cache
+            is_cache_owner: If True, this layer is responsible for quantizing the cache
 
         Returns:
             x: Output tensor (B, T, C)
             present: KV cache tuple if use_cache=True, else None
         """
-        attn_out, present = self.attn(self.ln_1(x), layer_past=layer_past, use_cache=use_cache)
+        attn_out, present = self.attn(self.ln_1(x), layer_past=layer_past, use_cache=use_cache, is_cache_owner=is_cache_owner)
         x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
         return x, present
@@ -157,6 +196,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    cross_layer_sharing: bool = False # Toggles the cross-layer sharing hack
+    kv_cache_quant: bool = False # Toggles INT8 quantization for KV cache
 
 class GPT(nn.Module):
 
@@ -210,7 +251,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, past_key_values=None, use_cache=False):
+    def forward(self, idx, targets=None, past_key_values=None, use_cache=False, cross_layer_sharing=None):
         """
         Forward pass with optional KV-cache support.
 
@@ -220,6 +261,7 @@ class GPT(nn.Module):
             past_key_values: Optional list of KV caches, one per layer
                             Each element is (key, value) tuple
             use_cache: If True, return updated KV caches
+            cross_layer_sharing: If True, enable cross-layer sharing hack
 
         Returns:
             logits: Output logits (B, T, vocab_size) or (B, 1, vocab_size) if no targets
@@ -229,10 +271,16 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
 
+        # Determine if we are using cross-layer sharing
+        use_cls = cross_layer_sharing if cross_layer_sharing is not None else self.config.cross_layer_sharing
+        
         # Calculate position offset from cache
         past_length = 0
         if past_key_values is not None:
-            past_length = past_key_values[0][0].size(2)  # (B, nh, T_past, hs)
+            if self.config.kv_cache_quant:
+                past_length = past_key_values[0][0][0].size(2)  # (B, nh, T_past, hs)
+            else:
+                past_length = past_key_values[0][0].size(2)  # (B, nh, T_past, hs)
 
         # Validate sequence length
         total_length = past_length + t
@@ -250,10 +298,18 @@ class GPT(nn.Module):
         # Process through transformer blocks, collecting KV caches
         present_key_values = [] if use_cache else None
         for i, block in enumerate(self.transformer.h):
-            layer_past = past_key_values[i] if past_key_values is not None else None
-            x, present = block(x, layer_past=layer_past, use_cache=use_cache)
+            if use_cls:
+                cache_idx = i // 2 # e.g. layer 0,1 -> 0; layer 2,3 -> 1
+                is_cache_owner = (i % 2 == 0)
+                layer_past = past_key_values[cache_idx] if past_key_values is not None else None
+            else:
+                is_cache_owner = True
+                layer_past = past_key_values[i] if past_key_values is not None else None
+            x, present = block(x, layer_past=layer_past, use_cache=use_cache, is_cache_owner=is_cache_owner)
             if use_cache:
-                present_key_values.append(present)
+                # with cross-layer sharing, only even layers store their cache
+                if not use_cls or is_cache_owner:
+                    present_key_values.append(present)
 
         x = self.transformer.ln_f(x)
 
@@ -280,7 +336,7 @@ class GPT(nn.Module):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
+    def from_pretrained(cls, model_type, override_args=None, override_kv_cache_quant=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
@@ -303,6 +359,10 @@ class GPT(nn.Module):
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
+        # override kv_cache_quant if desired
+        if override_kv_cache_quant is not None:
+            print(f"overriding kv_cache_quant to {override_kv_cache_quant}")
+            config_args['kv_cache_quant'] = override_kv_cache_quant
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
@@ -321,7 +381,7 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        assert len(sd_keys_hf) == len([k for k in sd_keys if 'c_attn_q' not in k]), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -333,6 +393,14 @@ class GPT(nn.Module):
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
+        
+        # Migrate weights for the new c_attn_q layer
+        with torch.no_grad():
+            for h in model.transformer.h:
+                q_weight = h.attn.c_attn.weight[:config.n_embd, :]
+                q_bias = h.attn.c_attn.bias[:config.n_embd]
+                h.attn.c_attn_q.weight.copy_(q_weight)
+                h.attn.c_attn_q.bias.copy_(q_bias)
 
         return model
 
@@ -379,7 +447,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True, cross_layer_sharing=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -391,6 +459,7 @@ class GPT(nn.Module):
             temperature: Sampling temperature (1.0 = no change)
             top_k: If set, only sample from top k tokens
             use_cache: If True, use KV-cache for efficient generation (default: True)
+            cross_layer_sharing: If True, enable cross-layer sharing hack
 
         Returns:
             idx: Generated sequence (B, T + max_new_tokens)
@@ -410,19 +479,30 @@ class GPT(nn.Module):
             logits, _, past_key_values = self(
                 idx_cond,
                 past_key_values=past_key_values if use_cache else None,
-                use_cache=use_cache
+                use_cache=use_cache,
+                cross_layer_sharing=cross_layer_sharing
             )
 
             # Handle cache overflow: if we exceed block_size, trim the cache
             if use_cache and past_key_values is not None:
-                cache_len = past_key_values[0][0].size(2)
+                if self.config.kv_cache_quant:
+                    cache_len = past_key_values[0][0][0].size(2)
+                else:
+                    cache_len = past_key_values[0][0].size(2)
                 if cache_len >= self.config.block_size:
                     # Trim cache to block_size - 1 to make room for next token
-                    past_key_values = [
-                        (k[:, :, -(self.config.block_size - 1):, :],
-                         v[:, :, -(self.config.block_size - 1):, :])
-                        for k, v in past_key_values
-                    ]
+                    if self.config.kv_cache_quant:
+                        past_key_values = [
+                            ((k[0][:, :, -(self.config.block_size - 1):, :], k[1]),
+                             (v[0][:, :, -(self.config.block_size - 1):, :], v[1]))
+                            for k, v in past_key_values
+                        ]
+                    else:
+                        past_key_values = [
+                            (k[:, :, -(self.config.block_size - 1):, :],
+                             v[:, :, -(self.config.block_size - 1):, :])
+                            for k, v in past_key_values
+                        ]
 
             # Pluck the logits at the final step and scale by temperature
             logits = logits[:, -1, :] / temperature
