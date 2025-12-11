@@ -33,6 +33,7 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn_q = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -68,26 +69,44 @@ class CausalSelfAttention(nn.Module):
         """
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # In cross-layer sharing, borrower layers (is_cache_owner=False) with a valid cache
+        # should only compute Q and reuse K,V from the cache owner.
+        can_borrow = self.config.cross_layer_sharing and not is_cache_owner and layer_past is not None
+
+        if can_borrow:
+            # Borrower layer: compute Q only, K and V will be taken from cache
+            q = self.c_attn_q(x)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            k, v = None, None
+        else:
+            # Owner layer or borrower without cache: compute Q, K, V
+            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # concatenate with past KV if available
         if layer_past is not None:
             if self.config.kv_cache_quant:
                 # Dequantize
                 (past_key_q, past_key_s), (past_value_q, past_value_s) = layer_past
-                past_key = past_key_q.to(torch.float16) * past_key_s
-                past_value = past_value_q.to(torch.float16) * past_value_s
+                past_key = past_key_q.to(q.dtype) * past_key_s
+                past_value = past_value_q.to(q.dtype) * past_value_s
             else:
                 past_key, past_value = layer_past
-            k = torch.cat([past_key, k], dim=2)   # (B, nh, T_past + T, hs)
-            v = torch.cat([past_value, v], dim=2) # (B, nh, T_past + T, hs)
+            
+            if can_borrow:
+                # Borrower uses cache owner's K,V directly
+                k, v = past_key, past_value
+            else:
+                # Owner concatenates new K,V with past
+                k = torch.cat([past_key, k], dim=2)   # (B, nh, T_past + T, hs)
+                v = torch.cat([past_value, v], dim=2) # (B, nh, T_past + T, hs)
 
         # prepare cache to return
         if use_cache:
+            # if cross-layer sharing is on, only owners should quantize and return a cache
+            # but we compute it here and let the GPT model decide whether to store it
             if self.config.kv_cache_quant and is_cache_owner:
                 # Quantize
                 k_scale = k.abs().max(dim=-1, keepdim=True).values / 127.0
@@ -280,7 +299,7 @@ class GPT(nn.Module):
         present_key_values = [] if use_cache else None
         for i, block in enumerate(self.transformer.h):
             if use_cls:
-                cache_idx = i if i % 2 == 0 else i - 1 # Cross-layer sharing for inference-time hack
+                cache_idx = i // 2 # e.g. layer 0,1 -> 0; layer 2,3 -> 1
                 is_cache_owner = (i % 2 == 0)
                 layer_past = past_key_values[cache_idx] if past_key_values is not None else None
             else:
@@ -288,7 +307,9 @@ class GPT(nn.Module):
                 layer_past = past_key_values[i] if past_key_values is not None else None
             x, present = block(x, layer_past=layer_past, use_cache=use_cache, is_cache_owner=is_cache_owner)
             if use_cache:
-                present_key_values.append(present)
+                # with cross-layer sharing, only even layers store their cache
+                if not use_cls or is_cache_owner:
+                    present_key_values.append(present)
 
         x = self.transformer.ln_f(x)
 
@@ -360,7 +381,7 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        assert len(sd_keys_hf) == len([k for k in sd_keys if 'c_attn_q' not in k]), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -372,6 +393,14 @@ class GPT(nn.Module):
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
+        
+        # Migrate weights for the new c_attn_q layer
+        with torch.no_grad():
+            for h in model.transformer.h:
+                q_weight = h.attn.c_attn.weight[:config.n_embd, :]
+                q_bias = h.attn.c_attn.bias[:config.n_embd]
+                h.attn.c_attn_q.weight.copy_(q_weight)
+                h.attn.c_attn_q.bias.copy_(q_bias)
 
         return model
 

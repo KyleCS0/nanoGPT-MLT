@@ -321,23 +321,59 @@ def test_grand_slam_cache_types():
     prompt = torch.randint(0, 50257, (1, 10))
 
     with torch.no_grad():
+        _, _, cache = model(prompt, use_cache=True, cross_layer_sharing=True)
+
+    # With cross-layer sharing, only owner layers (even) store cache
+    expected_cache_len = config.n_layer // 2
+    assert len(cache) == expected_cache_len, f"Expected {expected_cache_len} cache entries, got {len(cache)}"
+
+    # All stored caches should be from owner layers and should be quantized
+    for i, (k, v) in enumerate(cache):
+        # Owner (even) layers should have quantized cache: ((tensor, tensor), (tensor,tensor))
+        assert isinstance(k, tuple) and len(k) == 2, f"Cache {i} K should be a tuple (quantized)"
+        assert isinstance(v, tuple) and len(v) == 2, f"Cache {i} V should be a tuple (quantized)"
+        assert isinstance(k[0], torch.Tensor) and k[0].dtype == torch.int8, f"Cache {i} K[0] should be int8 tensor"
+        assert isinstance(v[0], torch.Tensor) and v[0].dtype == torch.int8, f"Cache {i} V[0] should be int8 tensor"
+
+    print("  PASSED")
+    return True
+
+
+def test_cross_layer_cache_size():
+    """Cross-layer sharing should halve cache size."""
+    print("Test 13: Cross-layer sharing cache size...")
+    config = GPTConfig(
+        n_layer=4, n_head=4, n_embd=128,
+        block_size=256, vocab_size=50257, dropout=0.0,
+        cross_layer_sharing=True
+    )
+    model = GPT(config).eval()
+    prompt = torch.randint(0, 50257, (1, 10))
+
+    with torch.no_grad():
         _, _, cache = model(prompt, use_cache=True)
 
-    assert len(cache) == config.n_layer, f"Expected {config.n_layer} cache entries, got {len(cache)}"
+    # Should only have 2 cache entries (layers 0 and 2), not 4
+    assert len(cache) == config.n_layer // 2, f"Expected {config.n_layer // 2} caches, got {len(cache)}"
+    print("  PASSED")
+    return True
 
-    for i, (k, v) in enumerate(cache):
-        is_owner = (i % 2 == 0)
-        if is_owner:
-            # Owner (even) layers should have quantized cache: ((tensor, tensor), (tensor,tensor))  
-            assert isinstance(k, tuple) and len(k) == 2, f"Layer {i} K should be a tuple (quantized)"
-            assert isinstance(v, tuple) and len(v) == 2, f"Layer {i} V should be a tuple (quantized)"
-            assert isinstance(k[0], torch.Tensor) and k[0].dtype == torch.int8, f"Layer {i} K[0] should be int8 tensor"
-            assert isinstance(v[0], torch.Tensor) and v[0].dtype == torch.int8, f"Layer {i} V[0] should be int8 tensor"
-        else:
-            # Borrower (odd) layers should have dequantized cache: (tensor, tensor)
-            assert isinstance(k, torch.Tensor), f"Layer {i} K should be a tensor (dequantized)"                                                                                
-            assert isinstance(v, torch.Tensor), f"Layer {i} V should be a tensor (dequantized)"
+def test_cross_layer_long_generation():
+    """Cross-layer sharing with cache trimming should work."""
+    print("Test 14: Cross-layer sharing long generation...")
+    config = GPTConfig(
+        n_layer=4, n_head=4, n_embd=128,
+        block_size=32, vocab_size=50257, dropout=0.0,
+        cross_layer_sharing=True
+    )
+    model = GPT(config).eval()
+    prompt = torch.randint(0, 50257, (1, 10))
 
+    # Generate beyond block_size to trigger trimming
+    with torch.no_grad():
+        out = model.generate(prompt, max_new_tokens=40, use_cache=True)
+
+    assert out.shape[1] == 50, f"Expected 50 tokens, got {out.shape[1]}"
     print("  PASSED")
     return True
 
@@ -360,6 +396,8 @@ if __name__ == "__main__":
         test_single_token_prompt,
         test_cache_reuse_across_calls,
         test_grand_slam_cache_types,
+        test_cross_layer_cache_size,
+        test_cross_layer_long_generation,
     ]
 
     passed = 0
