@@ -50,7 +50,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, layer_past=None, use_cache=False):
+    def forward(self, x, layer_past=None, use_cache=False, is_cache_owner=True):
         """
         Forward pass with optional KV-cache support.
 
@@ -60,6 +60,7 @@ class CausalSelfAttention(nn.Module):
                - Cached inference: T = 1 (new token only)
             layer_past: Optional tuple (past_key, past_value) each (B, nh, T_past, hs)
             use_cache: If True, return updated KV cache
+            is_cache_owner: If True, this layer is responsible for quantizing the cache
 
         Returns:
             y: Output tensor (B, T, C)
@@ -87,7 +88,7 @@ class CausalSelfAttention(nn.Module):
 
         # prepare cache to return
         if use_cache:
-            if self.config.kv_cache_quant:
+            if self.config.kv_cache_quant and is_cache_owner:
                 # Quantize
                 k_scale = k.abs().max(dim=-1, keepdim=True).values / 127.0
                 k_quant = (k / k_scale).round().to(torch.int8)
@@ -148,7 +149,7 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, layer_past=None, use_cache=False):
+    def forward(self, x, layer_past=None, use_cache=False, is_cache_owner=True):
         """
         Forward pass with optional KV-cache support.
 
@@ -156,12 +157,13 @@ class Block(nn.Module):
             x: Input tensor (B, T, C)
             layer_past: Optional KV cache for this block's attention layer
             use_cache: If True, return updated KV cache
+            is_cache_owner: If True, this layer is responsible for quantizing the cache
 
         Returns:
             x: Output tensor (B, T, C)
             present: KV cache tuple if use_cache=True, else None
         """
-        attn_out, present = self.attn(self.ln_1(x), layer_past=layer_past, use_cache=use_cache)
+        attn_out, present = self.attn(self.ln_1(x), layer_past=layer_past, use_cache=use_cache, is_cache_owner=is_cache_owner)
         x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
         return x, present
@@ -279,10 +281,12 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             if use_cls:
                 cache_idx = i if i % 2 == 0 else i - 1 # Cross-layer sharing for inference-time hack
+                is_cache_owner = (i % 2 == 0)
                 layer_past = past_key_values[cache_idx] if past_key_values is not None else None
             else:
+                is_cache_owner = True
                 layer_past = past_key_values[i] if past_key_values is not None else None
-            x, present = block(x, layer_past=layer_past, use_cache=use_cache)
+            x, present = block(x, layer_past=layer_past, use_cache=use_cache, is_cache_owner=is_cache_owner)
             if use_cache:
                 present_key_values.append(present)
 

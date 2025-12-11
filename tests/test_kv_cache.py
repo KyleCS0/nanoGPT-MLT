@@ -307,6 +307,40 @@ def test_cache_reuse_across_calls():
     print("  PASSED")
     return True
 
+def test_grand_slam_cache_types():
+    """Verify cache types for combined quantization and cross-layer sharing."""
+    print("Test 12: Grand Slam cache types...")
+
+    config = GPTConfig(
+        n_layer=4, n_head=4, n_embd=128,
+        block_size=256, vocab_size=50257, dropout=0.0,
+        cross_layer_sharing=True, kv_cache_quant=True
+    )
+    model = GPT(config).eval()
+
+    prompt = torch.randint(0, 50257, (1, 10))
+
+    with torch.no_grad():
+        _, _, cache = model(prompt, use_cache=True)
+
+    assert len(cache) == config.n_layer, f"Expected {config.n_layer} cache entries, got {len(cache)}"
+
+    for i, (k, v) in enumerate(cache):
+        is_owner = (i % 2 == 0)
+        if is_owner:
+            # Owner (even) layers should have quantized cache: ((tensor, tensor), (tensor,tensor))  
+            assert isinstance(k, tuple) and len(k) == 2, f"Layer {i} K should be a tuple (quantized)"
+            assert isinstance(v, tuple) and len(v) == 2, f"Layer {i} V should be a tuple (quantized)"
+            assert isinstance(k[0], torch.Tensor) and k[0].dtype == torch.int8, f"Layer {i} K[0] should be int8 tensor"
+            assert isinstance(v[0], torch.Tensor) and v[0].dtype == torch.int8, f"Layer {i} V[0] should be int8 tensor"
+        else:
+            # Borrower (odd) layers should have dequantized cache: (tensor, tensor)
+            assert isinstance(k, torch.Tensor), f"Layer {i} K should be a tensor (dequantized)"                                                                                
+            assert isinstance(v, torch.Tensor), f"Layer {i} V should be a tensor (dequantized)"
+
+    print("  PASSED")
+    return True
+
 
 if __name__ == "__main__":
     print("=" * 50)
@@ -325,6 +359,7 @@ if __name__ == "__main__":
         test_long_generation,
         test_single_token_prompt,
         test_cache_reuse_across_calls,
+        test_grand_slam_cache_types,
     ]
 
     passed = 0
