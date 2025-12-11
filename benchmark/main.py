@@ -123,99 +123,111 @@ def create_prompt(config):
     return prompt
 
 @torch.no_grad()
-def decode_loop(model, prompt, T):
+def decode_loop(model, prompt, T, use_cache=False):
     """
     The shared decode-loop runner.
+
+    Args:
+        model: The GPT model
+        prompt: Input prompt tensor (B, prompt_len)
+        T: Number of tokens to generate
+        use_cache: If True, use KV-cache for efficient generation (v1)
+                   If False, recompute full sequence each step (v0)
     """
-    idx = prompt
-    for _ in range(T):
-        # if the sequence context is growing too long we must crop it at block_size
-        idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
-        # forward the model to get the logits for the index in the sequence
-        logits, _, _ = model(idx_cond)
-        # pluck the logits at the final step
-        logits = logits[:, -1, :]
-        # apply softmax to convert logits to (normalized) probabilities
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        # sample from the distribution
-        idx_next = torch.multinomial(probs, num_samples=1)
-        # append sampled index to the running sequence and continue
-        idx = torch.cat((idx, idx_next), dim=1)
-    return idx
+    # Use the model's generate method which handles caching properly
+    return model.generate(prompt, max_new_tokens=T, use_cache=use_cache)
 
 def run_latency_vs_T(config):
     print("Running Latency vs T benchmark...")
     model = load_model(config['model_config'], config['dtype'], config.get('pretrained'))
     prompt = create_prompt(config)
 
-    for T in config['T_values']:
-        print(f"  Benchmarking T={T}")
-        # Warmup runs
-        for _ in range(config['num_warmup_runs']):
-            decode_loop(model, prompt, T)
+    # Get versions to benchmark (default to both v0 and v1)
+    versions = config.get('versions', ['v0', 'v1'])
 
-        # Measured runs
-        run_times = []
-        for _ in range(config['num_measure_runs']):
-            torch.cuda.synchronize()
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            
-            start_event.record()
-            decode_loop(model, prompt, T)
-            end_event.record()
-            
-            torch.cuda.synchronize()
-            run_times.append(start_event.elapsed_time(end_event))
+    for version in versions:
+        use_cache = (version != 'v0')
+        print(f"\n  Version: {version} (use_cache={use_cache})")
 
-        time_total_ms_median = torch.median(torch.tensor(run_times)).item()
-        time_total_ms_mean = torch.mean(torch.tensor(run_times)).item()
-        time_total_ms_std = torch.std(torch.tensor(run_times)).item()
-        time_per_token_ms_median = time_total_ms_median / T
-        
-        result = {
-            'benchmark_name': 'latency_vs_T',
-            'T': T,
-            'time_total_ms_median': time_total_ms_median,
-            'time_total_ms_mean': time_total_ms_mean,
-            'time_total_ms_std': time_total_ms_std,
-            'time_per_token_ms_median': time_per_token_ms_median,
-        }
-        log_result(config, result)
-        print(f"    Median total time: {time_total_ms_median:.2f} ms")
-        print(f"    Median time per token: {time_per_token_ms_median:.4f} ms")
+        for T in config['T_values']:
+            print(f"    Benchmarking T={T}")
+            # Warmup runs
+            for _ in range(config['num_warmup_runs']):
+                decode_loop(model, prompt.clone(), T, use_cache=use_cache)
+
+            # Measured runs
+            run_times = []
+            for _ in range(config['num_measure_runs']):
+                torch.cuda.synchronize()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+
+                start_event.record()
+                decode_loop(model, prompt.clone(), T, use_cache=use_cache)
+                end_event.record()
+
+                torch.cuda.synchronize()
+                run_times.append(start_event.elapsed_time(end_event))
+
+            time_total_ms_median = torch.median(torch.tensor(run_times)).item()
+            time_total_ms_mean = torch.mean(torch.tensor(run_times)).item()
+            time_total_ms_std = torch.std(torch.tensor(run_times)).item()
+            time_per_token_ms_median = time_total_ms_median / T
+
+            result = {
+                'benchmark_name': 'latency_vs_T',
+                'version': version,
+                'use_cache': use_cache,
+                'T': T,
+                'time_total_ms_median': time_total_ms_median,
+                'time_total_ms_mean': time_total_ms_mean,
+                'time_total_ms_std': time_total_ms_std,
+                'time_per_token_ms_median': time_per_token_ms_median,
+            }
+            log_result(config, result)
+            print(f"      Median total time: {time_total_ms_median:.2f} ms")
+            print(f"      Median time per token: {time_per_token_ms_median:.4f} ms")
 
 def run_vram_vs_T(config):
     print("Running VRAM vs T benchmark...")
     model = load_model(config['model_config'], config['dtype'], config.get('pretrained'))
     prompt = create_prompt(config)
 
-    for T in config['T_values']:
-        print(f"  Benchmarking T={T}")
-        
-        # Reset memory stats and sync
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
+    # Get versions to benchmark (default to both v0 and v1)
+    versions = config.get('versions', ['v0', 'v1'])
 
-        # Baseline allocation with model on device (weights, buffers)
-        baseline_alloc_bytes = torch.cuda.memory_allocated()
+    for version in versions:
+        use_cache = (version != 'v0')
+        print(f"\n  Version: {version} (use_cache={use_cache})")
 
-        # Measured run
-        decode_loop(model, prompt, T)
-        torch.cuda.synchronize()
+        for T in config['T_values']:
+            print(f"    Benchmarking T={T}")
 
-        peak_memory_bytes = torch.cuda.max_memory_allocated()
-        peak_activation_bytes = max(0, peak_memory_bytes - baseline_alloc_bytes)
-        
-        result = {
-            'benchmark_name': 'vram_vs_T',
-            'T': T,
-            'peak_memory_bytes': peak_memory_bytes,
-            'peak_activation_bytes': peak_activation_bytes,
-        }
-        log_result(config, result)
-        print(f"    Peak memory: {peak_memory_bytes / 1e9:.2f} GB")
+            # Reset memory stats and sync
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+
+            # Baseline allocation with model on device (weights, buffers)
+            baseline_alloc_bytes = torch.cuda.memory_allocated()
+
+            # Measured run
+            decode_loop(model, prompt.clone(), T, use_cache=use_cache)
+            torch.cuda.synchronize()
+
+            peak_memory_bytes = torch.cuda.max_memory_allocated()
+            peak_activation_bytes = max(0, peak_memory_bytes - baseline_alloc_bytes)
+
+            result = {
+                'benchmark_name': 'vram_vs_T',
+                'version': version,
+                'use_cache': use_cache,
+                'T': T,
+                'peak_memory_bytes': peak_memory_bytes,
+                'peak_activation_bytes': peak_activation_bytes,
+            }
+            log_result(config, result)
+            print(f"      Peak memory: {peak_memory_bytes / 1e9:.2f} GB")
 
 def run_per_phase_timing(config):
     print("Running Per-phase timing benchmark...")
@@ -296,6 +308,8 @@ def main():
     parser.add_argument('--clear-log', action='store_true', help='Clear the results log file before running benchmarks.')
     parser.add_argument('--preset', type=str, choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'],
                         help='Use a pretrained GPT-2 preset for the model.')
+    parser.add_argument('--version', type=str, nargs='+', default=None,
+                        help='Version(s) to benchmark: v0 (no cache), v1 (with cache). Default: both.')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -307,6 +321,12 @@ def main():
     else:
         # honor config file if it already specified pretrained
         config['pretrained'] = config.get('pretrained', 'gpt2')  # default to gpt2 per user request
+
+    # Apply version(s) from CLI
+    if args.version:
+        config['versions'] = args.version
+    elif 'versions' not in config:
+        config['versions'] = ['v0', 'v1']  # default to both
 
     # Optionally clear the results log
     if args.clear_log:
