@@ -1,15 +1,27 @@
 """
 Roofline profiling script for KV Cache analysis.
 
-Three-stage profiling to evaluate KV cache effect:
+Multi-stage profiling to evaluate different KV cache optimization variants:
+
+Base versions (prefill/decode):
   v0_prefill: Full forward on P tokens, no cache (baseline)
   v1_prefill: Full forward on P tokens, with cache enabled (cache build)
   v1_decode:  Single token decode using cached K/V (cache reuse)
 
+Extended versions (for v2/v3/v4):
+  v2_prefill: Full forward with INT8 quantized cache
+  v2_decode:  Single token decode with INT8 quantized cache
+  v3_prefill: Full forward with cross-layer sharing
+  v3_decode:  Single token decode with cross-layer sharing
+  v4_prefill: Full forward with INT8 + cross-layer sharing
+  v4_decode:  Single token decode with INT8 + cross-layer sharing
+
 Usage:
     python profile_decode_step.py --version v0_prefill --P 512
-    python profile_decode_step.py --version v1_prefill --P 512
     python profile_decode_step.py --version v1_decode --P 512
+    python profile_decode_step.py --version v2_decode --P 512  # INT8 quantization
+    python profile_decode_step.py --version v3_decode --P 512  # Cross-layer sharing
+    python profile_decode_step.py --version v4_decode --P 512  # INT8 + Cross-layer
 """
 import argparse
 import torch
@@ -18,6 +30,15 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from model import GPT
+from benchmark.versions import VERSIONS, load_model_for_version, get_version_config
+
+# Map roofline version names to base version and phase
+# e.g., 'v2_decode' -> version='v2', phase='decode'
+ROOFLINE_VERSIONS = {}
+for v in VERSIONS.keys():
+    ROOFLINE_VERSIONS[f'{v}_prefill'] = {'version': v, 'phase': 'prefill'}
+    if v != 'v0':  # v0 has no decode (no cache)
+        ROOFLINE_VERSIONS[f'{v}_decode'] = {'version': v, 'phase': 'decode'}
 
 # Fixed prompt tokens - excerpt from "Attention Is All You Need" abstract
 # This provides reproducible, meaningful input rather than random tokens
@@ -41,54 +62,72 @@ def get_prompt_tokens(tokenizer_encode, P, device, batch_size):
     return idx
 
 
-def profile_v0_prefill(model, prompt_tokens, device):
-    """V0: Full forward pass on P tokens WITHOUT KV cache.
+def profile_prefill(model, prompt_tokens, device, use_cache=False, cross_layer_sharing=None):
+    """Prefill: Full forward pass on P tokens.
 
-    Baseline: Full recomputation, no caching overhead.
-    This measures the cost of processing P tokens from scratch.
+    Args:
+        model: GPT model
+        prompt_tokens: Input tokens (B, P)
+        device: CUDA device
+        use_cache: Whether to build KV cache
+        cross_layer_sharing: Override for cross-layer sharing setting
+
+    Returns:
+        cache: KV cache if use_cache=True, else None
     """
     torch.cuda.synchronize()
     with torch.no_grad():
-        logits, _, _ = model(prompt_tokens, use_cache=False)
-    torch.cuda.synchronize()
-
-
-def profile_v1_prefill(model, prompt_tokens, device):
-    """V1 Prefill: Full forward pass on P tokens WITH KV cache enabled.
-
-    Similar compute to V0, but also writes K/V to cache.
-    Returns the cache for use in decode step.
-    """
-    torch.cuda.synchronize()
-    with torch.no_grad():
-        logits, _, cache = model(prompt_tokens, use_cache=True)
+        logits, _, cache = model(prompt_tokens, use_cache=use_cache,
+                                 cross_layer_sharing=cross_layer_sharing)
     torch.cuda.synchronize()
     return cache
 
 
-def profile_v1_decode(model, cache, device, batch_size):
-    """V1 Decode: Single token forward using cached K/V.
+def profile_decode(model, cache, device, batch_size, cross_layer_sharing=None):
+    """Decode: Single token forward using cached K/V.
 
     This is the key comparison point:
     - Processes only 1 new token
     - Reads cached K/V (P entries per layer)
     - Should show dramatically lower FLOPs
     - Should be memory-bound (low arithmetic intensity)
+
+    Args:
+        model: GPT model
+        cache: KV cache from prefill
+        device: CUDA device
+        batch_size: Batch size
+        cross_layer_sharing: Override for cross-layer sharing setting
     """
     # Single new token (position P+1)
     new_token = torch.randint(0, 50257, (batch_size, 1), device=device)
 
     torch.cuda.synchronize()
     with torch.no_grad():
-        logits, _, _ = model(new_token, past_key_values=cache, use_cache=True)
+        logits, _, _ = model(new_token, past_key_values=cache, use_cache=True,
+                            cross_layer_sharing=cross_layer_sharing)
     torch.cuda.synchronize()
 
 def main():
-    parser = argparse.ArgumentParser(description='Roofline profiling for KV Cache analysis')
+    # Build choices from ROOFLINE_VERSIONS
+    available_versions = list(ROOFLINE_VERSIONS.keys())
+    version_help = "Available versions:\n"
+    for rv, info in ROOFLINE_VERSIONS.items():
+        base_v = info['version']
+        phase = info['phase']
+        base_config = get_version_config(base_v)
+        version_help += f"  {rv}: {base_config['description']} ({phase})\n"
+
+    parser = argparse.ArgumentParser(
+        description='Roofline profiling for KV Cache analysis',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=version_help
+    )
     parser.add_argument('--version', type=str, required=True,
-                        choices=['v0_prefill', 'v1_prefill', 'v1_decode'],
-                        help='v0_prefill: no cache, v1_prefill: build cache, v1_decode: use cache')
+                        choices=available_versions,
+                        help='Profiling version (see below for full list)')
     parser.add_argument('--model', type=str, default='gpt2-medium',
+                        choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'],
                         help='Model: gpt2, gpt2-medium, gpt2-large, gpt2-xl')
     parser.add_argument('--P', type=int, default=512,
                         help='Prompt length (number of tokens for prefill)')
@@ -98,11 +137,24 @@ def main():
     args = parser.parse_args()
 
     device = 'cuda'
-    dtype = getattr(torch, args.dtype)
 
-    # Load model
-    print(f"Loading {args.model}...")
-    model = GPT.from_pretrained(args.model).to(device).to(dtype).eval()
+    # Parse roofline version to get base version and phase
+    rv_info = ROOFLINE_VERSIONS[args.version]
+    base_version = rv_info['version']
+    phase = rv_info['phase']
+    v_config = get_version_config(base_version)
+
+    use_cache = v_config['use_cache']
+    cross_layer_sharing = v_config['cross_layer_sharing']
+
+    # Load model configured for this version
+    print(f"Loading {args.model} for {args.version}...")
+    print(f"  Base version: {base_version} ({v_config['description']})")
+    print(f"  Phase: {phase}")
+    print(f"  kv_cache_quant: {v_config['kv_cache_quant']}")
+    print(f"  cross_layer_sharing: {cross_layer_sharing}")
+
+    model, _ = load_model_for_version(base_version, args.model, args.dtype)
 
     # Get tokenizer for encoding prompt
     import tiktoken
@@ -110,54 +162,51 @@ def main():
 
     # Get prompt tokens
     prompt_tokens = get_prompt_tokens(enc.encode, args.P, device, args.batch_size)
-    print(f"Prompt: {args.P} tokens, Batch: {args.batch_size}, Version: {args.version}")
+    print(f"\nPrompt: {args.P} tokens, Batch: {args.batch_size}")
 
     # Warmup (use same code path as profiled version)
     warmup_tokens = prompt_tokens[:, :min(32, args.P)]
     with torch.no_grad():
         for _ in range(3):
-            if args.version == 'v0_prefill':
+            if phase == 'prefill' and not use_cache:
                 model(warmup_tokens, use_cache=False)
             else:
-                _, _, warmup_cache = model(warmup_tokens, use_cache=True)
-                if args.version == 'v1_decode':
+                _, _, warmup_cache = model(warmup_tokens, use_cache=True,
+                                           cross_layer_sharing=cross_layer_sharing)
+                if phase == 'decode':
                     # Also warmup decode path
                     single_tok = torch.randint(0, 50257, (args.batch_size, 1), device=device)
-                    model(single_tok, past_key_values=warmup_cache, use_cache=True)
+                    model(single_tok, past_key_values=warmup_cache, use_cache=True,
+                          cross_layer_sharing=cross_layer_sharing)
     torch.cuda.synchronize()
 
-    # Profile based on version
-    if args.version == 'v0_prefill':
-        # V0: Full forward, no cache
-        print(f"Profiling V0 Prefill: {args.P} tokens, no cache...")
+    # Profile based on phase
+    if phase == 'prefill':
+        print(f"\nProfiling {args.version}: {args.P} tokens, use_cache={use_cache}...")
         torch.cuda.synchronize()
         torch.cuda.profiler.start()
-        profile_v0_prefill(model, prompt_tokens, device)
+        profile_prefill(model, prompt_tokens, device, use_cache=use_cache,
+                       cross_layer_sharing=cross_layer_sharing)
         torch.cuda.profiler.stop()
         torch.cuda.synchronize()
 
-    elif args.version == 'v1_prefill':
-        # V1 Prefill: Full forward, builds cache
-        print(f"Profiling V1 Prefill: {args.P} tokens, building cache...")
-        torch.cuda.synchronize()
-        torch.cuda.profiler.start()
-        profile_v1_prefill(model, prompt_tokens, device)
-        torch.cuda.profiler.stop()
-        torch.cuda.synchronize()
-
-    elif args.version == 'v1_decode':
-        # V1 Decode: Build cache first (not profiled), then profile single token decode
-        print(f"Building cache from {args.P} tokens (not profiled)...")
+    elif phase == 'decode':
+        # Build cache first (not profiled), then profile single token decode
+        print(f"\nBuilding cache from {args.P} tokens (not profiled)...")
         with torch.no_grad():
-            _, _, cache = model(prompt_tokens, use_cache=True)
+            _, _, cache = model(prompt_tokens, use_cache=True,
+                               cross_layer_sharing=cross_layer_sharing)
         torch.cuda.synchronize()
 
-        print(f"Profiling V1 Decode: 1 token with cache of {args.P} entries...")
+        print(f"Profiling {args.version}: 1 token with cache of {args.P} entries...")
         torch.cuda.synchronize()
         torch.cuda.profiler.start()
-        profile_v1_decode(model, cache, device, args.batch_size)
+        profile_decode(model, cache, device, args.batch_size,
+                      cross_layer_sharing=cross_layer_sharing)
         torch.cuda.profiler.stop()
         torch.cuda.synchronize()
+
+    print("\nProfiling complete.")
 
 
 if __name__ == '__main__':
