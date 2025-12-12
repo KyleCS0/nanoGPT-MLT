@@ -55,9 +55,9 @@ class KVCache:
             # INT8 quantized cache
             self.k_cache = torch.empty(cache_shape, device=device, dtype=torch.int8)
             self.v_cache = torch.empty(cache_shape, device=device, dtype=torch.int8)
-            # Per-layer scales (one scalar per layer)
-            self.k_scale = torch.ones(self.n_cache_layers, device=device, dtype=dtype)
-            self.v_scale = torch.ones(self.n_cache_layers, device=device, dtype=dtype)
+            # Per-token scales (one scale per position per layer)
+            self.k_scale = torch.ones((self.n_cache_layers, max_seq_len), device=device, dtype=dtype)
+            self.v_scale = torch.ones((self.n_cache_layers, max_seq_len), device=device, dtype=dtype)
         else:
             # FP16/BF16 cache
             self.k_cache = torch.empty(cache_shape, device=device, dtype=dtype)
@@ -90,8 +90,9 @@ class KVCache:
         self.v_cache[layer_idx, :, :, start_pos:end_pos, :] = v
 
         if self.kv_cache_quant and k_scale is not None:
-            self.k_scale[layer_idx] = k_scale
-            self.v_scale[layer_idx] = v_scale
+            # Store per-token scales (not per-layer!)
+            self.k_scale[layer_idx, start_pos:end_pos] = k_scale
+            self.v_scale[layer_idx, start_pos:end_pos] = v_scale
 
         return T_new
 
@@ -112,7 +113,8 @@ class KVCache:
         v = self.v_cache[layer_idx, :, :, :end_pos, :]
 
         if self.kv_cache_quant:
-            return ((k, self.k_scale[layer_idx]), (v, self.v_scale[layer_idx]))
+            # Return per-token scales for correct dequantization
+            return ((k, self.k_scale[layer_idx, :end_pos]), (v, self.v_scale[layer_idx, :end_pos]))
         else:
             return (k, v)
 
@@ -132,6 +134,10 @@ class KVCache:
         start = self.seq_len - keep_len
         self.k_cache[:, :, :, :keep_len, :] = self.k_cache[:, :, :, start:self.seq_len, :].clone()
         self.v_cache[:, :, :, :keep_len, :] = self.v_cache[:, :, :, start:self.seq_len, :].clone()
+        # Also shift per-token scales if INT8 quantized
+        if self.kv_cache_quant:
+            self.k_scale[:, :keep_len] = self.k_scale[:, start:self.seq_len].clone()
+            self.v_scale[:, :keep_len] = self.v_scale[:, start:self.seq_len].clone()
         self.seq_len = keep_len
 
     def reset(self):
@@ -202,7 +208,9 @@ class CausalSelfAttention(nn.Module):
 
         # In cross-layer sharing, borrower layers (is_cache_owner=False) with a valid cache
         # should only compute Q and reuse K,V from the cache owner.
-        has_past = layer_past is not None or (use_kv_cache and kv_cache.seq_len > 0)
+        # Note: with KVCache, owner writes before borrower reads (same forward pass),
+        # so borrower can always borrow via include_new=T, even when seq_len=0.
+        has_past = layer_past is not None or use_kv_cache
         can_borrow = self.config.cross_layer_sharing and not is_cache_owner and has_past
 
         if can_borrow:
@@ -225,8 +233,9 @@ class CausalSelfAttention(nn.Module):
                 layer_cache = kv_cache.get(cache_layer_idx, include_new=T)
                 if self.config.kv_cache_quant:
                     (k_quant, k_scale), (v_quant, v_scale) = layer_cache
-                    k = k_quant.to(q.dtype) * k_scale
-                    v = v_quant.to(q.dtype) * v_scale
+                    # Per-token dequantization: scale is (seq_len,), broadcast to (1, 1, seq_len, 1)
+                    k = k_quant.to(q.dtype) * k_scale.view(1, 1, -1, 1)
+                    v = v_quant.to(q.dtype) * v_scale.view(1, 1, -1, 1)
                 else:
                     k, v = layer_cache
             else:
@@ -250,8 +259,9 @@ class CausalSelfAttention(nn.Module):
                 layer_cache = kv_cache.get(cache_layer_idx, include_new=T)
                 if self.config.kv_cache_quant:
                     (k_quant, k_scale), (v_quant, v_scale) = layer_cache
-                    k = k_quant.to(q.dtype) * k_scale
-                    v = v_quant.to(q.dtype) * v_scale
+                    # Per-token dequantization: scale is (seq_len,), broadcast to (1, 1, seq_len, 1)
+                    k = k_quant.to(q.dtype) * k_scale.view(1, 1, -1, 1)
+                    v = v_quant.to(q.dtype) * v_scale.view(1, 1, -1, 1)
                 else:
                     k, v = layer_cache
 
@@ -501,10 +511,11 @@ class GPT(nn.Module):
                 layer_past = past_key_values[i] if past_key_values is not None else None
 
             # Pass KVCache if using optimized path
+            # Note: cache_layer_idx must be passed to BOTH owner and borrower layers
             x, present = block(
                 x, layer_past=layer_past, use_cache=use_cache, is_cache_owner=is_cache_owner,
                 kv_cache=kv_cache if use_kv_cache else None,
-                cache_layer_idx=cache_idx if (use_kv_cache and is_cache_owner) else None
+                cache_layer_idx=cache_idx if use_kv_cache else None
             )
 
             if use_cache and not use_kv_cache:

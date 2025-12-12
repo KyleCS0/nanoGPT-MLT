@@ -3,16 +3,22 @@
 Perplexity evaluation for nanoGPT KV-cache optimization variants.
 
 Measures model quality on WikiText-2 to verify optimizations don't degrade accuracy.
-Uses sliding window evaluation with configurable stride.
 
-Note: Perplexity is measured via forward pass (teacher forcing), so v0/v1/v2/v3/v4
-all produce identical perplexity since the optimizations only affect generation.
-However, we iterate over versions for consistency and to verify model loading works.
+Two evaluation modes:
+1. Teacher-forcing (default): Full sequence forward pass. Fast but doesn't use KV-cache,
+   so all versions produce identical perplexity.
+2. Autoregressive (--autoregressive): Processes one token at a time with KV-cache.
+   Slower but actually tests cache optimizations (INT8 quantization, cross-layer sharing).
 
 Usage:
+    # Teacher-forcing mode (fast, but doesn't test cache)
     python benchmark/perplexity.py --version v0 v1
-    python benchmark/perplexity.py --preset gpt2-medium --version v0 v1
-    python benchmark/perplexity.py --max-tokens 10000  # Quick test
+
+    # Autoregressive mode (slow, but properly tests cache optimizations)
+    python benchmark/perplexity.py --autoregressive --version v0 v1 v2 v3 v4
+
+    # Quick test with limited tokens
+    python benchmark/perplexity.py --autoregressive --max-tokens 10000 --version v1 v2
 """
 
 import argparse
@@ -29,8 +35,9 @@ import tiktoken
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from model import GPT, GPTConfig
+from model import GPT, GPTConfig, KVCache
 from benchmark.versions import VERSIONS, get_version_config, load_model_for_version, get_model_config_dict
+import torch.nn.functional as F
 
 
 def load_wikitext2(max_tokens=None):
@@ -149,6 +156,91 @@ def compute_perplexity(model, tokens, stride=512, device='cuda'):
     return perplexity, avg_loss, total_tokens
 
 
+@torch.no_grad()
+def compute_perplexity_autoregressive(model, tokens, device='cuda', use_cache=True,
+                                       cross_layer_sharing=False):
+    """
+    Compute perplexity using true autoregressive evaluation (one token at a time).
+
+    This method processes tokens sequentially, using the KV-cache at each step.
+    Unlike teacher forcing, this actually exercises the cache optimizations and
+    will reveal any quality degradation from INT8 quantization or cross-layer sharing.
+
+    Args:
+        model: GPT model
+        tokens: 1D tensor of token IDs
+        device: Device to run on
+        use_cache: Whether to use KV-cache (False for v0 baseline)
+        cross_layer_sharing: Whether cross-layer sharing is enabled
+
+    Returns:
+        perplexity: exp(avg_loss)
+        avg_loss: Average cross-entropy loss per token
+        total_tokens: Number of tokens evaluated
+    """
+    model.eval()
+    block_size = model.config.block_size
+
+    # Initialize KV-cache (for v1-v4)
+    kv_cache = None
+    if use_cache:
+        kv_cache = KVCache(
+            batch_size=1,
+            max_seq_len=block_size,
+            n_heads=model.config.n_head,
+            head_dim=model.config.n_embd // model.config.n_head,
+            n_layers=model.config.n_layer,
+            device=device,
+            dtype=next(model.parameters()).dtype,
+            cross_layer_sharing=cross_layer_sharing,
+            kv_cache_quant=model.config.kv_cache_quant,
+        )
+
+    nll_sum = 0.0
+    total_tokens = 0
+
+    pbar = tqdm(range(len(tokens) - 1), desc="Evaluating (autoregressive)")
+
+    for t in pbar:
+        current_token = tokens[t:t+1].unsqueeze(0).to(device)  # [1, 1]
+        target_token = tokens[t+1].to(device)  # scalar
+
+        # Handle context overflow: trim cache if at block_size
+        if kv_cache is not None and kv_cache.seq_len >= block_size:
+            kv_cache.trim(block_size - 1)
+
+        # Forward pass
+        if use_cache and kv_cache is not None:
+            logits, _, _ = model(
+                current_token,
+                use_cache=True,
+                cross_layer_sharing=cross_layer_sharing,
+                kv_cache=kv_cache
+            )
+        else:
+            # v0: No cache - must pass full context each time (capped at block_size)
+            ctx_start = max(0, t - block_size + 1)
+            context = tokens[ctx_start:t+1].unsqueeze(0).to(device)
+            logits, _, _ = model(context, use_cache=False)
+
+        # Get logits for next token prediction (last position)
+        next_logits = logits[0, -1, :]  # [vocab_size]
+
+        # Cross-entropy loss
+        loss = F.cross_entropy(next_logits.unsqueeze(0), target_token.unsqueeze(0))
+        nll_sum += loss.item()
+        total_tokens += 1
+
+        # Update progress bar
+        current_loss = nll_sum / total_tokens
+        pbar.set_postfix({'loss': f'{current_loss:.4f}'})
+
+    avg_loss = nll_sum / total_tokens
+    perplexity = math.exp(avg_loss)
+
+    return perplexity, avg_loss, total_tokens
+
+
 def log_result(result, log_file, model_config, preset, dtype):
     """
     Append result to JSONL log file.
@@ -220,9 +312,12 @@ def main():
         description="Perplexity evaluation for nanoGPT KV-cache variants",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Note: Perplexity is measured via forward pass (teacher forcing), so all versions
-produce identical perplexity since the optimizations only affect generation.
-We iterate over versions for consistency and to verify model loading works correctly.
+Evaluation modes:
+  Default (teacher-forcing): Fast but doesn't use KV-cache. All versions identical.
+  --autoregressive: Slow but tests cache. May show differences for INT8/cross-layer.
+
+Example:
+  python benchmark/perplexity.py --autoregressive --max-tokens 10000 --version v1 v2
         """
     )
     parser.add_argument(
@@ -258,6 +353,11 @@ We iterate over versions for consistency and to verify model loading works corre
         '--clear-log', action='store_true',
         help='Clear the results log before running'
     )
+    parser.add_argument(
+        '--autoregressive', action='store_true',
+        help='Use autoregressive evaluation (one token at a time with KV-cache). '
+             'Slower but actually tests cache optimizations.'
+    )
 
     args = parser.parse_args()
 
@@ -275,12 +375,16 @@ We iterate over versions for consistency and to verify model loading works corre
     # Load dataset
     tokens = load_wikitext2(max_tokens=args.max_tokens)
 
+    eval_mode = "autoregressive" if args.autoregressive else "teacher-forcing"
+
     print(f"\n" + "=" * 70)
     print("Perplexity Evaluation")
     print("=" * 70)
     print(f"  Model: {args.preset}")
     print(f"  Dataset: WikiText-2 (test split)")
-    print(f"  Stride: {args.stride}")
+    print(f"  Mode: {eval_mode}")
+    if not args.autoregressive:
+        print(f"  Stride: {args.stride}")
     print(f"  Tokens: {len(tokens):,}")
     print(f"  Versions: {', '.join(args.version)}")
     print("=" * 70)
@@ -298,13 +402,20 @@ We iterate over versions for consistency and to verify model loading works corre
         print(f"\n--- Evaluating {version} ({desc}) ---")
         print(f"    kv_cache_quant={v_config['kv_cache_quant']}, cross_layer_sharing={v_config['cross_layer_sharing']}")
 
-        # Note: Perplexity uses forward pass only, not generation
-        # So use_cache doesn't affect the result - all versions should be identical
-        # We still iterate over versions to verify model loading works correctly
-
-        ppl, loss, n_tokens = compute_perplexity(
-            model, tokens, stride=args.stride
-        )
+        if args.autoregressive:
+            # Autoregressive: processes one token at a time with KV-cache
+            # This actually tests the cache optimizations
+            ppl, loss, n_tokens = compute_perplexity_autoregressive(
+                model, tokens,
+                use_cache=use_cache,
+                cross_layer_sharing=v_config['cross_layer_sharing']
+            )
+        else:
+            # Teacher-forcing: full sequence forward pass (cache not used)
+            # All versions produce identical perplexity
+            ppl, loss, n_tokens = compute_perplexity(
+                model, tokens, stride=args.stride
+            )
 
         results[version] = {
             'perplexity': ppl,
@@ -324,7 +435,8 @@ We iterate over versions for consistency and to verify model loading works corre
             'kv_cache_quant': v_config['kv_cache_quant'],
             'cross_layer_sharing': v_config['cross_layer_sharing'],
             'dataset': 'wikitext-2',
-            'stride': args.stride,
+            'eval_mode': eval_mode,
+            'stride': args.stride if not args.autoregressive else None,
             'num_tokens_evaluated': n_tokens,
             'perplexity': ppl,
             'loss': loss,

@@ -13,3 +13,5 @@ venv/
 local_*
 claude.md
 benchmark/roofline/ncu_reports/*.ncu-rep
+benchmark/plots/*
+benchmark/results.jsonl
