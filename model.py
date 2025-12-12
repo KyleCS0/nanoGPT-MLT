@@ -88,31 +88,33 @@ class CausalSelfAttention(nn.Module):
         # concatenate with past KV if available
         if layer_past is not None:
             if self.config.kv_cache_quant:
-                # Dequantize
+                # INT8 path: dequantize cache, concat with new K,V
                 (past_key_q, past_key_s), (past_value_q, past_value_s) = layer_past
                 past_key = past_key_q.to(q.dtype) * past_key_s
                 past_value = past_value_q.to(q.dtype) * past_value_s
+                if can_borrow:
+                    k, v = past_key, past_value
+                else:
+                    k = torch.cat([past_key, k], dim=2)
+                    v = torch.cat([past_value, v], dim=2)
             else:
                 past_key, past_value = layer_past
-            
-            if can_borrow:
-                # Borrower uses cache owner's K,V directly
-                k, v = past_key, past_value
-            else:
-                # Owner concatenates new K,V with past
-                k = torch.cat([past_key, k], dim=2)   # (B, nh, T_past + T, hs)
-                v = torch.cat([past_value, v], dim=2) # (B, nh, T_past + T, hs)
+                if can_borrow:
+                    k, v = past_key, past_value
+                else:
+                    k = torch.cat([past_key, k], dim=2)
+                    v = torch.cat([past_value, v], dim=2)
 
         # prepare cache to return
         if use_cache:
-            # if cross-layer sharing is on, only owners should quantize and return a cache
-            # but we compute it here and let the GPT model decide whether to store it
             if self.config.kv_cache_quant and is_cache_owner:
-                # Quantize
-                k_scale = k.abs().max(dim=-1, keepdim=True).values / 127.0
-                k_quant = (k / k_scale).round().to(torch.int8)
-                v_scale = v.abs().max(dim=-1, keepdim=True).values / 127.0
-                v_quant = (v / v_scale).round().to(torch.int8)
+                # Quantize for storage (saves memory, costs some compute)
+                k_absmax = k.abs().max()
+                k_scale = k_absmax / 127.0 if k_absmax > 0 else torch.tensor(1.0, device=k.device, dtype=k.dtype)
+                k_quant = (k / k_scale).round().clamp(-127, 127).to(torch.int8)
+                v_absmax = v.abs().max()
+                v_scale = v_absmax / 127.0 if v_absmax > 0 else torch.tensor(1.0, device=v.device, dtype=v.dtype)
+                v_quant = (v / v_scale).round().clamp(-127, 127).to(torch.int8)
                 present = ((k_quant, k_scale), (v_quant, v_scale))
             else:
                 present = (k, v)
