@@ -35,84 +35,137 @@ from benchmark.versions import (
     get_use_cache, get_cross_layer_sharing, get_model_config_dict
 )
 
-# --- Patched Model for Per-phase Timing ---
-def _forward_stepwise_for_timing(model, idx, timings, past_key_values=None, use_cache=False, cross_layer_sharing=False):
+# --- Per-phase Timing via Hooks (smart, DRY approach) ---
+class PhaseTimer:
     """
-    Forward pass mirroring GPT.forward, with CUDA event timings per phase.
+    Context manager that instruments a GPT model with CUDA event hooks for per-phase timing.
 
-    Supports KV-cache and cross-layer sharing for accurate timing of all versions.
+    This approach:
+    - Uses PyTorch hooks instead of duplicating forward pass logic
+    - Automatically stays in sync with model changes
+    - Works with all versions (v0-v4) without code duplication
+
+    Usage:
+        timer = PhaseTimer(model)
+        with timer:
+            output = model.generate(...)
+        phase_times = timer.get_phase_times_ms()
     """
-    device = idx.device
-    b, t = idx.size()
 
-    # Determine if we are using cross-layer sharing
-    use_cls = cross_layer_sharing if cross_layer_sharing is not None else model.config.cross_layer_sharing
+    def __init__(self, model):
+        self.model = model
+        self.hooks = []
+        self.events = {
+            'embedding': [],  # (start, end) tuples
+            'attention': [],
+            'mlp': [],
+            'head': [],
+        }
 
-    # Calculate position offset from cache
-    past_length = 0
-    if past_key_values is not None:
-        if model.config.kv_cache_quant:
-            past_length = past_key_values[0][0][0].size(2)
-        else:
-            past_length = past_key_values[0][0].size(2)
+    def __enter__(self):
+        self._register_hooks()
+        return self
 
-    total_length = past_length + t
-    assert total_length <= model.config.block_size, "Sequence too long"
-    pos = torch.arange(past_length, past_length + t, dtype=torch.long, device=device)
+    def __exit__(self, *args):
+        self._remove_hooks()
 
-    # Embedding
-    emb_start = torch.cuda.Event(enable_timing=True)
-    emb_end = torch.cuda.Event(enable_timing=True)
-    emb_start.record()
-    tok_emb = model.transformer.wte(idx)
-    pos_emb = model.transformer.wpe(pos)
-    x = model.transformer.drop(tok_emb + pos_emb)
-    emb_end.record()
-    timings['embedding'].append((emb_start, emb_end))
+    def _make_event_pair(self):
+        """Create a start/end CUDA event pair."""
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        return start, end
 
-    # Process through transformer blocks with KV-cache support
-    present_key_values = [] if use_cache else None
-    for i, block in enumerate(model.transformer.h):
-        if use_cls:
-            cache_idx = i // 2
-            is_cache_owner = (i % 2 == 0)
-            layer_past = past_key_values[cache_idx] if past_key_values is not None else None
-        else:
-            is_cache_owner = True
-            layer_past = past_key_values[i] if past_key_values is not None else None
+    def _register_hooks(self):
+        """Register forward hooks on model components."""
+        # Embedding: capture wte (token embedding) start, drop (dropout) end
+        # This spans: wte -> wpe -> addition -> drop
+        def emb_pre_hook(module, inputs):
+            start, end = self._make_event_pair()
+            self.events['embedding'].append((start, end))
+            start.record()
 
-        # Attention
-        attn_start = torch.cuda.Event(enable_timing=True)
-        attn_end = torch.cuda.Event(enable_timing=True)
-        attn_start.record()
-        attn_out, present = block.attn(block.ln_1(x), layer_past=layer_past, use_cache=use_cache, is_cache_owner=is_cache_owner)
-        x = x + attn_out
-        attn_end.record()
-        timings['attention'].append((attn_start, attn_end))
+        def emb_post_hook(module, inputs, output):
+            if self.events['embedding']:
+                self.events['embedding'][-1][1].record()
 
-        if use_cache:
-            if not use_cls or is_cache_owner:
-                present_key_values.append(present)
+        # Hook wte for start (first op in embedding)
+        h = self.model.transformer.wte.register_forward_pre_hook(emb_pre_hook)
+        self.hooks.append(h)
+        # Hook drop for end (last op in embedding)
+        h = self.model.transformer.drop.register_forward_hook(emb_post_hook)
+        self.hooks.append(h)
 
-        # MLP
-        mlp_start = torch.cuda.Event(enable_timing=True)
-        mlp_end = torch.cuda.Event(enable_timing=True)
-        mlp_start.record()
-        x = x + block.mlp(block.ln_2(x))
-        mlp_end.record()
-        timings['mlp'].append((mlp_start, mlp_end))
+        # Attention and MLP: hook each block's components
+        for block in self.model.transformer.h:
+            # Attention (CausalSelfAttention)
+            def attn_pre_hook(module, inputs):
+                start, end = self._make_event_pair()
+                self.events['attention'].append((start, end))
+                start.record()
 
-    x = model.transformer.ln_f(x)
+            def attn_post_hook(module, inputs, output):
+                if self.events['attention']:
+                    self.events['attention'][-1][1].record()
 
-    # Head (project only last time step)
-    head_start = torch.cuda.Event(enable_timing=True)
-    head_end = torch.cuda.Event(enable_timing=True)
-    head_start.record()
-    logits = model.lm_head(x[:, [-1], :])
-    head_end.record()
-    timings['head'].append((head_start, head_end))
+            h = block.attn.register_forward_pre_hook(attn_pre_hook)
+            self.hooks.append(h)
+            h = block.attn.register_forward_hook(attn_post_hook)
+            self.hooks.append(h)
 
-    return logits, present_key_values
+            # MLP
+            def mlp_pre_hook(module, inputs):
+                start, end = self._make_event_pair()
+                self.events['mlp'].append((start, end))
+                start.record()
+
+            def mlp_post_hook(module, inputs, output):
+                if self.events['mlp']:
+                    self.events['mlp'][-1][1].record()
+
+            h = block.mlp.register_forward_pre_hook(mlp_pre_hook)
+            self.hooks.append(h)
+            h = block.mlp.register_forward_hook(mlp_post_hook)
+            self.hooks.append(h)
+
+        # Head (lm_head)
+        def head_pre_hook(module, inputs):
+            start, end = self._make_event_pair()
+            self.events['head'].append((start, end))
+            start.record()
+
+        def head_post_hook(module, inputs, output):
+            if self.events['head']:
+                self.events['head'][-1][1].record()
+
+        h = self.model.lm_head.register_forward_pre_hook(head_pre_hook)
+        self.hooks.append(h)
+        h = self.model.lm_head.register_forward_hook(head_post_hook)
+        self.hooks.append(h)
+
+    def _remove_hooks(self):
+        """Remove all registered hooks."""
+        for h in self.hooks:
+            h.remove()
+        self.hooks.clear()
+
+    def reset(self):
+        """Clear recorded events for a new measurement run."""
+        for phase in self.events:
+            self.events[phase] = []
+
+    def get_phase_times_ms(self):
+        """
+        Compute total time per phase in milliseconds.
+        Must be called after torch.cuda.synchronize().
+        """
+        torch.cuda.synchronize()
+        times = {}
+        for phase, event_pairs in self.events.items():
+            total = 0.0
+            for start, end in event_pairs:
+                total += start.elapsed_time(end)
+            times[phase] = total
+        return times
 
 def set_seed(seed):
     random.seed(seed)
@@ -382,19 +435,18 @@ def run_per_phase_timing(config):
     """
     Benchmark per-phase timing (embedding, attention, MLP, head) for each version.
 
-    Uses a custom forward pass that times each phase separately while supporting
-    KV-cache and cross-layer sharing for accurate timing of all versions.
+    Uses PyTorch hooks via PhaseTimer to instrument the model without duplicating
+    forward pass logic. This approach is DRY and automatically stays in sync with
+    any model changes.
     """
     print("Running Per-phase timing benchmark...")
 
-    # Get versions to benchmark (default to v0 and v1)
     versions = config.get('versions', ['v0', 'v1'])
     pretrained = config.get('pretrained', 'gpt2')
     dtype_str = config['dtype']
     T = config['T_star']
 
     for version in versions:
-        # Load model configured for this version
         model, v_config = load_model_for_version(version, pretrained, dtype_str)
         model_config_dict = get_model_config_dict(model)
         prompt = create_prompt(config, vocab_size=model.config.vocab_size)
@@ -406,87 +458,41 @@ def run_per_phase_timing(config):
         print(f"\n  Version: {version} ({desc})")
         print(f"    use_cache={use_cache}, kv_cache_quant={v_config['kv_cache_quant']}, cross_layer_sharing={cross_layer_sharing}")
 
-        # --- Stepwise decode with timing, supporting KV-cache ---
-        @torch.no_grad()
-        def decode_loop_stepwise(model, prompt, T, timings, use_cache, cross_layer_sharing):
-            idx = prompt
-            past_key_values = None
+        timer = PhaseTimer(model)
 
-            for step in range(T):
-                if use_cache and past_key_values is not None:
-                    # Cached: only feed the last token
-                    idx_cond = idx[:, -1:]
-                else:
-                    # Non-cached or first step: feed full sequence (up to block_size)
-                    idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
-
-                logits, past_key_values = _forward_stepwise_for_timing(
-                    model, idx_cond, timings,
-                    past_key_values=past_key_values if use_cache else None,
-                    use_cache=use_cache,
-                    cross_layer_sharing=cross_layer_sharing
-                )
-
-                probs = torch.nn.functional.softmax(logits[:, -1, :], dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
-                idx = torch.cat((idx, idx_next), dim=1)
-
-                # Handle cache overflow
-                if use_cache and past_key_values is not None:
-                    if model.config.kv_cache_quant:
-                        cache_len = past_key_values[0][0][0].size(2)
-                    else:
-                        cache_len = past_key_values[0][0].size(2)
-                    if cache_len >= model.config.block_size:
-                        # Trim cache
-                        if model.config.kv_cache_quant:
-                            past_key_values = [
-                                ((k[0][:, :, -(model.config.block_size - 1):, :], k[1]),
-                                 (v[0][:, :, -(model.config.block_size - 1):, :], v[1]))
-                                for k, v in past_key_values
-                            ]
-                        else:
-                            past_key_values = [
-                                (k[:, :, -(model.config.block_size - 1):, :],
-                                 v[:, :, -(model.config.block_size - 1):, :])
-                                for k, v in past_key_values
-                            ]
-
-            return idx
-
-        # Warmup
+        # Warmup (without timing)
         for _ in range(config['num_warmup_runs']):
-            timings = {'embedding': [], 'attention': [], 'mlp': [], 'head': []}
-            decode_loop_stepwise(model, prompt.clone(), T, timings, use_cache, cross_layer_sharing)
+            decode_loop(model, prompt.clone(), T, use_cache=use_cache,
+                       cross_layer_sharing=cross_layer_sharing)
+            torch.cuda.synchronize()
 
-        # Measurement
+        # Measurement runs with hooks
         all_run_phase_times = []
         for _ in range(config['num_measure_runs']):
-            timings = {'embedding': [], 'attention': [], 'mlp': [], 'head': []}
+            timer.reset()
 
             torch.cuda.synchronize()
             total_start = torch.cuda.Event(enable_timing=True)
             total_end = torch.cuda.Event(enable_timing=True)
 
-            total_start.record()
-            decode_loop_stepwise(model, prompt.clone(), T, timings, use_cache, cross_layer_sharing)
-            total_end.record()
+            with timer:
+                total_start.record()
+                decode_loop(model, prompt.clone(), T, use_cache=use_cache,
+                           cross_layer_sharing=cross_layer_sharing)
+                total_end.record()
+
             torch.cuda.synchronize()
 
-            phase_times = {phase: 0.0 for phase in timings}
-            for phase, events in timings.items():
-                for start, end in events:
-                    phase_times[phase] += start.elapsed_time(end)
-
+            phase_times = timer.get_phase_times_ms()
             phase_times['total'] = total_start.elapsed_time(total_end)
             all_run_phase_times.append(phase_times)
 
-        # Aggregate results
+        # Aggregate results using median
         median_phase_times = {}
         for phase in all_run_phase_times[0].keys():
             median_phase_times[phase] = torch.median(torch.tensor([run[phase] for run in all_run_phase_times])).item()
 
-        # Calculate "other"
+        # Calculate "other" (overhead not captured by hooks: layernorm, softmax, sampling, etc.)
         measured_sum = median_phase_times['embedding'] + median_phase_times['attention'] + median_phase_times['mlp'] + median_phase_times['head']
         median_phase_times['other'] = median_phase_times['total'] - measured_sum
 
@@ -506,7 +512,6 @@ def run_per_phase_timing(config):
         for phase, t in median_phase_times.items():
             print(f"      Median {phase} time: {t:.2f} ms")
 
-        # Clean up model to free memory before loading next version
         del model
         torch.cuda.empty_cache()
 

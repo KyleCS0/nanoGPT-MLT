@@ -254,18 +254,27 @@ def plot_vram_vs_T(data, output_dir, version='legacy'):
 
 def plot_per_phase_timing(data, output_dir):
     """
-    Plot per-phase timing breakdown.
-    Creates separate bar and pie chart figures.
+    Plot per-phase timing breakdown for all versions.
+    Creates a grouped bar chart comparing phases across versions.
     """
     if not data:
         print("  No per-phase timing data found.")
         return
-    
-    # Get the most recent result
-    record = data[-1]
-    phase_times = record['time_phase_ms']
-    T_star = record['T_star']
-    
+
+    # Group data by version, taking the latest record per version
+    version_data = {}
+    for record in data:
+        version = record.get('version', 'unknown')
+        version_data[version] = record  # Latest wins
+
+    if not version_data:
+        print("  No per-phase timing data found.")
+        return
+
+    # Sort versions for consistent ordering (v0, v1, v2, ...)
+    versions = sorted(version_data.keys())
+    T_star = version_data[versions[0]]['T_star']
+
     # Define phase order and colors
     phase_order = ['embedding', 'attention', 'mlp', 'head', 'other']
     phase_labels = {
@@ -282,74 +291,86 @@ def plot_per_phase_timing(data, output_dir):
         'head': '#F18F01',
         'other': '#999999'
     }
-    
-    # Extract data
-    phases = [p for p in phase_order if p in phase_times and p != 'total']
-    times = [phase_times[p] for p in phases]
-    labels = [phase_labels[p] for p in phases]
-    colors = [phase_colors[p] for p in phases]
-    
-    total_measured = sum(times)
-    percentages = [100 * t / total_measured for t in times]
-    
-    # Bar chart (standalone)
-    fig_bar, ax_bar = plt.subplots(figsize=(8, 6))
-    bars = ax_bar.bar(labels, times, color=colors, edgecolor='white', linewidth=1.5)
-    ax_bar.set_ylabel('Total Time (ms)', fontweight='bold')
-    ax_bar.set_title(f'Phase Timing Breakdown (T={T_star})', fontweight='bold', pad=15)
-    ax_bar.grid(True, axis='y', linestyle='--', alpha=0.3)
-    ax_bar.set_ylim(bottom=0, top=max(times) * 1.15)
-    ax_bar.tick_params(axis='x', rotation=15)
-    
-    for bar, time, pct in zip(bars, times, percentages):
-        height = bar.get_height()
-        ax_bar.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{time:.1f} ms', ha='center', va='bottom', fontsize=9)
-    
-    # Add system info
-    info = record
-    fig_bar.text(0.5, 0.02,
-                f"GPU: {info['gpu_name']} | PyTorch {info['pytorch_version']} | "
-                f"dtype: {info['dtype']} | Total Time: {total_measured:.1f} ms",
-                ha='center', fontsize=9, style='italic', color='#555555')
-    
-    fig_bar.tight_layout(rect=[0, 0.04, 1, 1])
-    bars_path = Path(output_dir) / 'per_phase_breakdown_bar.png'
-    fig_bar.savefig(bars_path, bbox_inches='tight', facecolor='white', edgecolor='none')
-    print(f"  Saved: {bars_path}")
-    plt.close(fig_bar)
 
-    # Pie chart (standalone) - hide labels <1%
-    fig_pie, ax_pie = plt.subplots(figsize=(8, 6))
-    explode = [0.05] * len(phases)
-    
-    # Custom autopct to hide small percentages
-    def autopct_format(pct):
-        return f'{pct:.1f}%' if pct >= 1.0 else ''
-    
-    wedges, texts, autotexts = ax_pie.pie(percentages, labels=labels, colors=colors,
-                                          autopct=autopct_format, startangle=90,
-                                          explode=explode,
-                                          wedgeprops=dict(edgecolor='white', linewidth=1.5))
-    
-    for autotext in autotexts:
-        autotext.set_color('white')
-        autotext.set_fontsize(10)
-        autotext.set_fontweight('bold')
-    
-    ax_pie.set_title(f'Phase Time Distribution (T={T_star})', fontweight='bold', pad=15)
-    
-    # Add system info
-    fig_pie.text(0.5, 0.02,
-                f"GPU: {info['gpu_name']} | PyTorch {info['pytorch_version']} | "
-                f"dtype: {info['dtype']} | Total Time: {total_measured:.1f} ms",
-                ha='center', fontsize=9, style='italic', color='#555555')
-    
-    fig_pie.tight_layout(rect=[0, 0.04, 1, 1])
-    pies_path = Path(output_dir) / 'per_phase_breakdown_pie.png'
-    fig_pie.savefig(pies_path, bbox_inches='tight', facecolor='white', edgecolor='none')
-    print(f"  Saved: {pies_path}")
-    plt.close(fig_pie)
+    # Get phases that exist in any version
+    all_phases = set()
+    for v in versions:
+        all_phases.update(version_data[v]['time_phase_ms'].keys())
+    phases = [p for p in phase_order if p in all_phases and p != 'total']
+
+    # --- Grouped bar chart comparing versions ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    x = np.arange(len(phases))
+    width = 0.8 / len(versions)  # Width of each bar
+    version_colors = plt.cm.tab10(np.linspace(0, 1, len(versions)))
+
+    for i, version in enumerate(versions):
+        phase_times = version_data[version]['time_phase_ms']
+        times = [phase_times.get(p, 0) for p in phases]
+        desc = version_data[version].get('version_description', version)
+        offset = (i - len(versions)/2 + 0.5) * width
+        bars = ax.bar(x + offset, times, width, label=f'{version} ({desc})',
+                     color=version_colors[i], edgecolor='white', linewidth=0.5)
+
+        # Add value labels on bars
+        for bar, t in zip(bars, times):
+            if t > 0:
+                ax.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                       f'{t:.0f}', ha='center', va='bottom', fontsize=7, rotation=0)
+
+    ax.set_ylabel('Time (ms)', fontweight='bold')
+    ax.set_xlabel('Phase', fontweight='bold')
+    ax.set_title(f'Per-Phase Timing Breakdown by Version (T={T_star})', fontweight='bold', pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels([phase_labels[p] for p in phases])
+    ax.legend(loc='upper right')
+    ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+
+    # Add system info from first record
+    info = version_data[versions[0]]
+    fig.text(0.5, 0.02,
+            f"GPU: {info['gpu_name']} | PyTorch {info['pytorch_version']} | dtype: {info['dtype']}",
+            ha='center', fontsize=9, style='italic', color='#555555')
+
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
+    bars_path = Path(output_dir) / 'per_phase_breakdown_bar.png'
+    fig.savefig(bars_path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {bars_path}")
+    plt.close(fig)
+
+    # --- Stacked bar chart showing total time breakdown ---
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+
+    bottom = np.zeros(len(versions))
+    for phase in phases:
+        times = [version_data[v]['time_phase_ms'].get(phase, 0) for v in versions]
+        ax2.bar(versions, times, bottom=bottom, label=phase_labels[phase],
+               color=phase_colors[phase], edgecolor='white', linewidth=0.5)
+        bottom += np.array(times)
+
+    # Add total time labels on top
+    for i, v in enumerate(versions):
+        total = version_data[v]['time_phase_ms'].get('total', sum(
+            version_data[v]['time_phase_ms'].get(p, 0) for p in phases))
+        ax2.text(i, bottom[i] + 10, f'{total:.0f} ms', ha='center', va='bottom',
+                fontsize=9, fontweight='bold')
+
+    ax2.set_ylabel('Time (ms)', fontweight='bold')
+    ax2.set_xlabel('Version', fontweight='bold')
+    ax2.set_title(f'Total Time Breakdown by Phase (T={T_star})', fontweight='bold', pad=15)
+    ax2.legend(loc='upper right')
+    ax2.grid(True, axis='y', linestyle='--', alpha=0.3)
+
+    fig2.text(0.5, 0.02,
+             f"GPU: {info['gpu_name']} | PyTorch {info['pytorch_version']} | dtype: {info['dtype']}",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    fig2.tight_layout(rect=[0, 0.04, 1, 1])
+    stacked_path = Path(output_dir) / 'per_phase_breakdown_stacked.png'
+    fig2.savefig(stacked_path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {stacked_path}")
+    plt.close(fig2)
 
 
 def save_metrics_summary(results, output_dir):
@@ -458,22 +479,30 @@ def save_metrics_summary(results, output_dir):
             summary['vram'][version_key] = vram_data
 
         elif benchmark_name == 'per_phase_timing' and data:
-            rec = data[-1]
-            phases = dict(rec.get('time_phase_ms', {}))
-            total = float(phases.get('total', 0.0))
-            # Percentages relative to total if available
-            percent = {}
-            for k, v in phases.items():
-                if k == 'total':
-                    continue
-                pct = (float(v) / total) if total > 0 else 0.0
-                percent[k] = float(pct)
+            # Group by version
+            version_data = {}
+            for rec in data:
+                version = rec.get('version', 'unknown')
+                version_data[version] = rec
 
-            summary['per_phase'] = {
-                'T_star': int(rec.get('T_star', 0)),
-                'times_ms': {k: float(v) for k, v in phases.items()},
-                'percent': percent,
-            }
+            if 'per_phase' not in summary:
+                summary['per_phase'] = {}
+
+            for version, rec in version_data.items():
+                phases = dict(rec.get('time_phase_ms', {}))
+                total = float(phases.get('total', 0.0))
+                percent = {}
+                for k, v in phases.items():
+                    if k == 'total':
+                        continue
+                    pct = (float(v) / total) if total > 0 else 0.0
+                    percent[k] = float(pct)
+
+                summary['per_phase'][version] = {
+                    'T_star': int(rec.get('T_star', 0)),
+                    'times_ms': {k: float(v) for k, v in phases.items()},
+                    'percent': percent,
+                }
 
     summary['meta'] = meta
 
@@ -1721,6 +1750,8 @@ def main():
     print()
 
     # Generate plots for each benchmark type and version
+    per_phase_all_data = []  # Collect all per_phase_timing data across versions
+
     for (benchmark_name, version), data in results.items():
         if benchmark_name == 'latency_vs_T':
             cache_label = get_cache_label(version)
@@ -1735,8 +1766,12 @@ def main():
             plot_vram_vs_T(data, output_dir, version=version)
 
         elif benchmark_name == 'per_phase_timing':
-            print("Generating Per-phase Timing plots...")
-            plot_per_phase_timing(data, output_dir)
+            per_phase_all_data.extend(data)
+
+    # Plot per_phase_timing with all versions combined
+    if per_phase_all_data:
+        print("Generating Per-phase Timing plots...")
+        plot_per_phase_timing(per_phase_all_data, output_dir)
 
     # Always emit JSON metrics summary
     print("Writing metrics summary JSON...")

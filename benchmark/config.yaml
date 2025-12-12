@@ -7,7 +7,7 @@ model_config:
   n_embd: 768
   block_size: 1024
   vocab_size: 50257
-
+pretrained: gpt2-medium
 # Execution configuration
 dtype: 'bfloat16' # 'float32', 'bfloat16', or 'float16'
 prompt_length: 32
