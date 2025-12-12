@@ -39,9 +39,13 @@ def load_results(log_file):
 
     Groups results by (benchmark_name, version) for version-aware plotting.
     Legacy results without version field are grouped under 'legacy'.
-    """
-    results = defaultdict(list)
 
+    IMPORTANT: Deduplicates by taking the FIRST record for each unique
+    (benchmark_name, version, T) combination to handle multiple runs.
+    Rationale: First complete run is usually consistent; later partial runs may corrupt data.
+    """
+    # First pass: collect all records
+    raw_results = defaultdict(list)
     with open(log_file, 'r') as f:
         for line in f:
             if line.strip():
@@ -49,7 +53,25 @@ def load_results(log_file):
                 benchmark_name = record['benchmark_name']
                 version = record.get('version', 'legacy')
                 key = (benchmark_name, version)
-                results[key].append(record)
+                raw_results[key].append(record)
+
+    # Second pass: deduplicate by T value (keep FIRST occurrence)
+    # Rationale: The first complete benchmark run is usually consistent.
+    # Later runs may be partial/interrupted, causing inconsistent data.
+    results = defaultdict(list)
+    for key, records in raw_results.items():
+        benchmark_name = key[0]
+        if benchmark_name in ('latency_vs_T', 'vram_vs_T'):
+            # Deduplicate by T - keep FIRST record for each T
+            by_T = {}
+            for r in records:
+                T = r.get('T')
+                if T is not None and T not in by_T:
+                    by_T[T] = r  # Only keep if not already seen
+            results[key] = list(by_T.values())
+        else:
+            # For other benchmarks, keep all records
+            results[key] = records
 
     return results
 
@@ -78,14 +100,15 @@ def r2_score(y_true, y_pred):
 
 def get_cache_label(version):
     """Convert version to human-readable cache label."""
-    if version == 'v0':
-        return 'KV-cache OFF'
-    elif version == 'v1':
-        return 'KV-cache ON'
-    elif version == 'legacy':
-        return ''
-    else:
-        return f'KV-cache {version}'
+    labels = {
+        'v0': 'v0: No cache',
+        'v1': 'v1: KV-cache',
+        'v2': 'v2: KV + INT8',
+        'v3': 'v3: KV + cross-layer',
+        'v4': 'v4: KV + INT8 + cross-layer',
+        'legacy': '',
+    }
+    return labels.get(version, f'{version}')
 
 
 def plot_latency_vs_T(data, output_dir, version='legacy'):
@@ -463,17 +486,46 @@ def save_metrics_summary(results, output_dir):
 
 # --- Comparison plots: multiple versions on the same graph ---
 
+def compute_ci95(std, n_samples=10):
+    """Compute 95% confidence interval half-width from standard deviation.
+
+    Uses t-distribution approximation for small samples.
+    CI = mean ± t_{0.975, n-1} * std / sqrt(n)
+    For n=10, t_{0.975,9} ≈ 2.262
+    """
+    from scipy import stats
+    if n_samples <= 1:
+        return std
+    t_val = stats.t.ppf(0.975, df=n_samples - 1)
+    return t_val * std / np.sqrt(n_samples)
+
+
 # Color palette for version comparison
 VERSION_COLORS = {
     'v0': '#E63946',  # Red for no-cache
     'v1': '#2A9D8F',  # Teal for with-cache
+    'v2': '#F4A261',  # Orange for INT8 quantization
+    'v3': '#6A4C93',  # Purple for cross-layer sharing
+    'v4': '#264653',  # Dark teal for combined
     'legacy': '#457B9D',  # Blue for legacy
 }
 
 VERSION_MARKERS = {
     'v0': 'o',
     'v1': 's',
-    'legacy': '^',
+    'v2': '^',
+    'v3': 'd',
+    'v4': 'p',
+    'legacy': 'x',
+}
+
+VERSION_LABELS = {
+    'v0': 'v0: No cache',
+    'v1': 'v1: KV-cache',
+    'v2': 'v2: KV + INT8',
+    'v3': 'v3: KV + cross-layer',
+    'v4': 'v4: KV + INT8 + cross-layer',
+    'legacy': 'Legacy',
 }
 
 
@@ -746,6 +798,888 @@ def plot_vram_comparison(results, output_dir):
     plt.close()
 
 
+def plot_throughput_comparison(results, output_dir):
+    """
+    Plot throughput comparison: tokens/second vs T for all versions.
+    Throughput = 1000 / time_per_token_ms (tokens/sec)
+    """
+    # Collect latency data for all versions
+    latency_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T':
+            latency_data[version] = sorted(data, key=lambda x: x['T'])
+
+    if len(latency_data) < 2:
+        print("  Need at least 2 versions for throughput comparison. Skipping.")
+        return
+
+    first_data = next(iter(latency_data.values()))[0]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for version, data in sorted(latency_data.items()):
+        T_values = [d['T'] for d in data]
+        # Throughput = 1000 / time_per_token_ms (tokens/second)
+        throughput = [1000.0 / d['time_per_token_ms_median'] for d in data]
+        label = get_cache_label(version)
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+
+        ax.plot(T_values, throughput, f'{marker}-',
+                markersize=6, linewidth=2,
+                color=color, label=label)
+
+    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
+    ax.set_ylabel('Throughput (tokens/second)', fontweight='bold')
+    ax.set_title('Generation Throughput: KV-Cache Comparison', fontweight='bold', pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='lower left')
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    # Add annotation
+    ax.annotate('Higher is better',
+                xy=(0.98, 0.98), xycoords='axes fraction',
+                fontsize=9, ha='right', va='top', style='italic', color='#555555')
+
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data['gpu_name']} | Throughput = 1000 / time_per_token_ms",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_throughput.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_memory_efficiency_comparison(results, output_dir):
+    """
+    Plot memory efficiency: latency per MB of VRAM used.
+    Lower is better (faster per unit memory).
+    """
+    # Collect latency and vram data for all versions
+    latency_data = {}
+    vram_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T':
+            latency_data[version] = {d['T']: d for d in data}
+        elif benchmark_name == 'vram_vs_T':
+            vram_data[version] = {d['T']: d for d in data}
+
+    # Find versions that have both latency and vram data
+    common_versions = set(latency_data.keys()) & set(vram_data.keys())
+    if len(common_versions) < 2:
+        print("  Need at least 2 versions with both latency and VRAM data. Skipping memory efficiency plot.")
+        return
+
+    first_version = sorted(common_versions)[0]
+    first_data = list(latency_data[first_version].values())[0]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for version in sorted(common_versions):
+        lat_by_T = latency_data[version]
+        vram_by_T = vram_data[version]
+
+        # Find common T values
+        common_T = sorted(set(lat_by_T.keys()) & set(vram_by_T.keys()))
+        if not common_T:
+            continue
+
+        T_values = []
+        efficiency = []  # ms per MB
+
+        for T in common_T:
+            lat = lat_by_T[T]['time_total_ms_median']
+            vram_mb = vram_by_T[T]['peak_memory_bytes'] / 1e6
+            if vram_mb > 0:
+                T_values.append(T)
+                efficiency.append(lat / vram_mb)  # ms per MB
+
+        label = get_cache_label(version)
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+
+        ax.plot(T_values, efficiency, f'{marker}-',
+                markersize=6, linewidth=2,
+                color=color, label=label)
+
+    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
+    ax.set_ylabel('Latency per MB VRAM (ms/MB)', fontweight='bold')
+    ax.set_title('Memory Efficiency: Latency per Memory Used', fontweight='bold', pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True)
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    # Add annotation
+    ax.annotate('Lower is better\n(more efficient)',
+                xy=(0.98, 0.98), xycoords='axes fraction',
+                fontsize=9, ha='right', va='top', style='italic', color='#555555')
+
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data['gpu_name']} | Efficiency = total_latency_ms / peak_vram_MB",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_memory_efficiency.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_latency_comparison_with_ci(results, output_dir, default_n_samples=10):
+    """
+    Plot per-token latency comparison with 95% confidence intervals.
+
+    Uses n_samples from data if available, otherwise falls back to default.
+    """
+    # Collect latency data for all versions
+    latency_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T':
+            latency_data[version] = sorted(data, key=lambda x: x['T'])
+
+    if len(latency_data) < 2:
+        print("  Need at least 2 versions for CI comparison. Skipping.")
+        return
+
+    first_data = next(iter(latency_data.values()))[0]
+    # Get n_samples from data if available
+    n_samples = first_data.get('n_samples', default_n_samples)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for version, data in sorted(latency_data.items()):
+        T_values = np.array([d['T'] for d in data])
+        time_per_token = np.array([d['time_per_token_ms_median'] for d in data])
+
+        # Compute 95% CI from std, using per-point n_samples if available
+        time_std = np.array([d.get('time_per_token_ms_std', 0) for d in data])
+        n_per_point = np.array([d.get('n_samples', default_n_samples) for d in data])
+        ci95 = np.array([compute_ci95(s, n) for s, n in zip(time_std, n_per_point)])
+
+        label = get_cache_label(version)
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+
+        # Plot line with markers
+        ax.plot(T_values, time_per_token, f'{marker}-',
+                markersize=5, linewidth=2,
+                color=color, label=label)
+
+        # Add CI band
+        ax.fill_between(T_values,
+                        time_per_token - ci95,
+                        time_per_token + ci95,
+                        color=color, alpha=0.2)
+
+    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
+    ax.set_ylabel('Time per Token (ms)', fontweight='bold')
+    ax.set_title('Per-Token Latency with 95% Confidence Intervals', fontweight='bold', pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='upper left')
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data['gpu_name']} | Shaded regions: 95% CI (n={n_samples})",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_per_token_latency_ci.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_total_latency_comparison_with_ci(results, output_dir, default_n_samples=10):
+    """
+    Plot total latency comparison with 95% confidence intervals.
+
+    Uses n_samples from data if available, otherwise falls back to default.
+    """
+    # Collect latency data for all versions
+    latency_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T':
+            latency_data[version] = sorted(data, key=lambda x: x['T'])
+
+    if len(latency_data) < 2:
+        print("  Need at least 2 versions for CI comparison. Skipping.")
+        return
+
+    first_data = next(iter(latency_data.values()))[0]
+    # Get n_samples from data if available
+    n_samples = first_data.get('n_samples', default_n_samples)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for version, data in sorted(latency_data.items()):
+        T_values = np.array([d['T'] for d in data])
+        time_total = np.array([d['time_total_ms_median'] for d in data])
+
+        # Compute 95% CI from std, using per-point n_samples if available
+        time_std = np.array([d.get('time_total_ms_std', 0) for d in data])
+        n_per_point = np.array([d.get('n_samples', default_n_samples) for d in data])
+        ci95 = np.array([compute_ci95(s, n) for s, n in zip(time_std, n_per_point)])
+
+        label = get_cache_label(version)
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+
+        # Plot line with markers
+        ax.plot(T_values, time_total, f'{marker}-',
+                markersize=5, linewidth=2,
+                color=color, label=label)
+
+        # Add CI band
+        ax.fill_between(T_values,
+                        time_total - ci95,
+                        time_total + ci95,
+                        color=color, alpha=0.2)
+
+    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
+    ax.set_ylabel('Total Generation Time (ms)', fontweight='bold')
+    ax.set_title('Total Latency with 95% Confidence Intervals', fontweight='bold', pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='upper left')
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data['gpu_name']} | Shaded regions: 95% CI (n={n_samples})",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_total_latency_ci.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_pareto_memory_latency(results, output_dir, T_target=512):
+    """
+    Plot Memory vs Latency Pareto chart.
+    X: Peak VRAM (MB), Y: Total Latency (ms) at a fixed T value.
+    Each point represents one version - shows tradeoff between memory and speed.
+    """
+    latency_data = {}
+    vram_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T':
+            latency_data[version] = {d['T']: d for d in data}
+        elif benchmark_name == 'vram_vs_T':
+            vram_data[version] = {d['T']: d for d in data}
+
+    # Find versions with both latency and VRAM data at T_target
+    versions_with_data = []
+    for v in set(latency_data.keys()) & set(vram_data.keys()):
+        if T_target in latency_data[v] and T_target in vram_data[v]:
+            versions_with_data.append(v)
+
+    if len(versions_with_data) < 2:
+        print(f"  Need at least 2 versions with data at T={T_target} for Pareto plot. Skipping.")
+        return
+
+    first_data = list(latency_data[versions_with_data[0]].values())[0]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for version in sorted(versions_with_data):
+        vram_mb = vram_data[version][T_target]['peak_memory_bytes'] / 1e6
+        latency_ms = latency_data[version][T_target]['time_total_ms_median']
+
+        label = get_cache_label(version)
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+
+        ax.scatter(vram_mb, latency_ms, s=150, c=color, marker=marker,
+                   label=label, edgecolors='white', linewidth=1.5, zorder=5)
+
+        # Add version label next to point
+        ax.annotate(version, (vram_mb, latency_ms),
+                    xytext=(8, 5), textcoords='offset points',
+                    fontsize=9, fontweight='bold', color=color)
+
+    ax.set_xlabel('Peak VRAM Usage (MB)', fontweight='bold')
+    ax.set_ylabel(f'Total Latency at T={T_target} (ms)', fontweight='bold')
+    ax.set_title(f'Memory-Latency Tradeoff (T={T_target})', fontweight='bold', pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='upper right')
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    # Add Pareto frontier annotation
+    ax.annotate('← Lower is better (both axes)',
+                xy=(0.02, 0.02), xycoords='axes fraction',
+                fontsize=9, ha='left', va='bottom', style='italic', color='#555555')
+
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data['gpu_name']} | Ideal: bottom-left corner",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'pareto_memory_latency.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_throughput_comparison_with_ci(results, output_dir, default_n_samples=10):
+    """
+    Plot throughput comparison with 95% confidence intervals.
+    Throughput = 1000 / time_per_token_ms (tokens/sec)
+    """
+    latency_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T':
+            latency_data[version] = sorted(data, key=lambda x: x['T'])
+
+    if len(latency_data) < 2:
+        print("  Need at least 2 versions for throughput CI comparison. Skipping.")
+        return
+
+    first_data = next(iter(latency_data.values()))[0]
+    n_samples = first_data.get('n_samples', default_n_samples)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for version, data in sorted(latency_data.items()):
+        T_values = np.array([d['T'] for d in data])
+        time_per_token = np.array([d['time_per_token_ms_median'] for d in data])
+        throughput = 1000.0 / time_per_token  # tokens/sec
+
+        # Propagate uncertainty: if throughput = 1000/t, then
+        # delta_throughput ≈ throughput * (delta_t / t)
+        time_std = np.array([d.get('time_per_token_ms_std', 0) for d in data])
+        n_per_point = np.array([d.get('n_samples', default_n_samples) for d in data])
+        ci95_time = np.array([compute_ci95(s, n) for s, n in zip(time_std, n_per_point)])
+
+        # CI for throughput (error propagation)
+        ci95_throughput = throughput * (ci95_time / time_per_token)
+
+        label = get_cache_label(version)
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+
+        ax.plot(T_values, throughput, f'{marker}-',
+                markersize=5, linewidth=2,
+                color=color, label=label)
+
+        ax.fill_between(T_values,
+                        throughput - ci95_throughput,
+                        throughput + ci95_throughput,
+                        color=color, alpha=0.2)
+
+    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
+    ax.set_ylabel('Throughput (tokens/second)', fontweight='bold')
+    ax.set_title('Generation Throughput with 95% Confidence Intervals', fontweight='bold', pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='lower left')
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    ax.annotate('Higher is better',
+                xy=(0.98, 0.98), xycoords='axes fraction',
+                fontsize=9, ha='right', va='top', style='italic', color='#555555')
+
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data['gpu_name']} | Shaded regions: 95% CI (n={n_samples})",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_throughput_ci.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_perplexity_comparison(results, output_dir):
+    """
+    Plot perplexity comparison across versions as a bar chart.
+
+    Perplexity is measured via forward pass (teacher forcing), so all versions
+    should produce identical results. This plot verifies that optimizations
+    don't degrade model quality.
+    """
+    # Collect perplexity data
+    perplexity_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'perplexity':
+            # Take the latest record for each version
+            if data:
+                perplexity_data[version] = data[-1]
+
+    if not perplexity_data:
+        print("  No perplexity data found. Skipping perplexity plot.")
+        return
+
+    # Sort versions
+    versions = sorted(perplexity_data.keys())
+    perplexities = [perplexity_data[v]['perplexity'] for v in versions]
+
+    # Get baseline (v0) for comparison
+    baseline_ppl = perplexity_data.get('v0', {}).get('perplexity', perplexities[0])
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Create bar chart
+    x_pos = np.arange(len(versions))
+    colors = [VERSION_COLORS.get(v, '#666666') for v in versions]
+
+    bars = ax.bar(x_pos, perplexities, color=colors, edgecolor='black', linewidth=1.2)
+
+    # Add value labels on bars
+    for i, (bar, ppl) in enumerate(zip(bars, perplexities)):
+        height = bar.get_height()
+        # Calculate degradation from baseline
+        if baseline_ppl > 0:
+            deg = ((ppl - baseline_ppl) / baseline_ppl) * 100
+            deg_str = f"\n({deg:+.2f}%)" if versions[i] != 'v0' else "\n(baseline)"
+        else:
+            deg_str = ""
+        ax.annotate(f'{ppl:.2f}{deg_str}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    # Labels
+    version_labels = [get_cache_label(v) for v in versions]
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(version_labels, rotation=15, ha='right')
+
+    ax.set_xlabel('Version', fontweight='bold')
+    ax.set_ylabel('Perplexity', fontweight='bold')
+    ax.set_title('Perplexity Comparison Across Versions (WikiText-2)', fontweight='bold', pad=15)
+    ax.grid(True, linestyle='--', alpha=0.3, axis='y')
+
+    # Set y-axis to start near minimum value for better visualization
+    min_ppl = min(perplexities)
+    max_ppl = max(perplexities)
+    margin = (max_ppl - min_ppl) * 0.3 if max_ppl != min_ppl else min_ppl * 0.1
+    ax.set_ylim(bottom=max(0, min_ppl - margin), top=max_ppl + margin * 2)
+
+    # Add note about expected behavior
+    ax.annotate('Note: All versions should have identical perplexity\n'
+                '(KV-cache only affects generation, not forward pass)',
+                xy=(0.02, 0.98), xycoords='axes fraction',
+                fontsize=8, ha='left', va='top', style='italic', color='#555555',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='wheat', alpha=0.5))
+
+    # Add system info
+    first_data = next(iter(perplexity_data.values()))
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data.get('gpu_name', 'N/A')} | "
+             f"Dataset: {first_data.get('dataset', 'WikiText-2')} | "
+             f"Stride: {first_data.get('stride', 'N/A')}",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_perplexity.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_perplexity_degradation(results, output_dir):
+    """
+    Plot perplexity degradation from baseline as a horizontal bar chart.
+
+    Shows the percentage difference from v0 baseline for each version.
+    Useful for quickly identifying if any optimization degrades quality.
+    """
+    # Collect perplexity data
+    perplexity_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'perplexity':
+            if data:
+                perplexity_data[version] = data[-1]
+
+    if not perplexity_data or 'v0' not in perplexity_data:
+        print("  No perplexity data or no v0 baseline. Skipping degradation plot.")
+        return
+
+    baseline_ppl = perplexity_data['v0']['perplexity']
+
+    # Sort versions (excluding v0)
+    versions = sorted([v for v in perplexity_data.keys() if v != 'v0'])
+    if not versions:
+        print("  Only v0 found. Skipping degradation plot.")
+        return
+
+    degradations = []
+    for v in versions:
+        ppl = perplexity_data[v]['perplexity']
+        deg = ((ppl - baseline_ppl) / baseline_ppl) * 100
+        degradations.append(deg)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    y_pos = np.arange(len(versions))
+    colors = ['#2ecc71' if d <= 0.1 else '#e74c3c' if d > 1.0 else '#f39c12'
+              for d in degradations]
+
+    bars = ax.barh(y_pos, degradations, color=colors, edgecolor='black', linewidth=1.2)
+
+    # Add value labels
+    for bar, deg in zip(bars, degradations):
+        width = bar.get_width()
+        label_x = width + 0.05 if width >= 0 else width - 0.05
+        ha = 'left' if width >= 0 else 'right'
+        ax.annotate(f'{deg:+.3f}%',
+                    xy=(label_x, bar.get_y() + bar.get_height() / 2),
+                    va='center', ha=ha, fontsize=10, fontweight='bold')
+
+    # Labels
+    version_labels = [get_cache_label(v) for v in versions]
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(version_labels)
+
+    ax.set_xlabel('Perplexity Degradation from Baseline (%)', fontweight='bold')
+    ax.set_ylabel('Version', fontweight='bold')
+    ax.set_title('Perplexity Degradation Relative to v0 (No Cache)', fontweight='bold', pad=15)
+    ax.axvline(x=0, color='black', linewidth=1.5, linestyle='-')
+    ax.grid(True, linestyle='--', alpha=0.3, axis='x')
+
+    # Add threshold annotations
+    ax.axvline(x=0.1, color='green', linewidth=1, linestyle='--', alpha=0.7)
+    ax.axvline(x=1.0, color='red', linewidth=1, linestyle='--', alpha=0.7)
+
+    # Legend for thresholds
+    ax.annotate('Green: ≤0.1% | Yellow: 0.1-1% | Red: >1%',
+                xy=(0.98, 0.02), xycoords='axes fraction',
+                fontsize=8, ha='right', va='bottom', style='italic', color='#555555')
+
+    first_data = next(iter(perplexity_data.values()))
+    fig.text(0.5, 0.02,
+             f"Baseline (v0) perplexity: {baseline_ppl:.2f} | "
+             f"Dataset: {first_data.get('dataset', 'WikiText-2')}",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_perplexity_degradation.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def export_latex_tables(results, output_dir):
+    """
+    Export publication-ready LaTeX tables for benchmark results.
+    Creates tables for:
+    1. Latency comparison across versions
+    2. VRAM comparison across versions
+    3. Summary statistics table
+    4. Perplexity comparison table
+    """
+    # Collect data
+    latency_data = {}
+    vram_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T':
+            latency_data[version] = {d['T']: d for d in data}
+        elif benchmark_name == 'vram_vs_T':
+            vram_data[version] = {d['T']: d for d in data}
+
+    if not latency_data:
+        print("  No latency data for LaTeX export. Skipping.")
+        return
+
+    # Get sorted versions and T values
+    versions = sorted(latency_data.keys())
+    all_T = set()
+    for v_data in latency_data.values():
+        all_T.update(v_data.keys())
+    T_values = sorted(all_T)
+
+    # Version labels for table headers
+    version_headers = {
+        'v0': r'No Cache',
+        'v1': r'KV-Cache',
+        'v2': r'KV+INT8',
+        'v3': r'KV+Share',
+        'v4': r'KV+INT8+Share',
+    }
+
+    # --- Table 1: Per-Token Latency Comparison ---
+    latex_lines = []
+    latex_lines.append(r"% Per-Token Latency Comparison Table")
+    latex_lines.append(r"% Auto-generated by plot_results.py")
+    latex_lines.append(r"\begin{table}[htbp]")
+    latex_lines.append(r"  \centering")
+    latex_lines.append(r"  \caption{Per-Token Generation Latency (ms) Across Cache Configurations}")
+    latex_lines.append(r"  \label{tab:per_token_latency}")
+
+    # Build column spec
+    col_spec = "r" + "r" * len(versions)
+    latex_lines.append(r"  \begin{tabular}{" + col_spec + r"}")
+    latex_lines.append(r"    \toprule")
+
+    # Header row
+    header = r"    $T$ & " + " & ".join([version_headers.get(v, v) for v in versions]) + r" \\"
+    latex_lines.append(header)
+    latex_lines.append(r"    \midrule")
+
+    # Data rows
+    for T in T_values:
+        row_values = [str(T)]
+        for v in versions:
+            if v in latency_data and T in latency_data[v]:
+                val = latency_data[v][T]['time_per_token_ms_median']
+                row_values.append(f"{val:.2f}")
+            else:
+                row_values.append("--")
+        latex_lines.append("    " + " & ".join(row_values) + r" \\")
+
+    latex_lines.append(r"    \bottomrule")
+    latex_lines.append(r"  \end{tabular}")
+    latex_lines.append(r"\end{table}")
+    latex_lines.append("")
+
+    # --- Table 2: Total Latency Comparison ---
+    latex_lines.append(r"% Total Latency Comparison Table")
+    latex_lines.append(r"\begin{table}[htbp]")
+    latex_lines.append(r"  \centering")
+    latex_lines.append(r"  \caption{Total Generation Latency (ms) Across Cache Configurations}")
+    latex_lines.append(r"  \label{tab:total_latency}")
+    latex_lines.append(r"  \begin{tabular}{" + col_spec + r"}")
+    latex_lines.append(r"    \toprule")
+    latex_lines.append(header)
+    latex_lines.append(r"    \midrule")
+
+    for T in T_values:
+        row_values = [str(T)]
+        for v in versions:
+            if v in latency_data and T in latency_data[v]:
+                val = latency_data[v][T]['time_total_ms_median']
+                row_values.append(f"{val:.1f}")
+            else:
+                row_values.append("--")
+        latex_lines.append("    " + " & ".join(row_values) + r" \\")
+
+    latex_lines.append(r"    \bottomrule")
+    latex_lines.append(r"  \end{tabular}")
+    latex_lines.append(r"\end{table}")
+    latex_lines.append("")
+
+    # --- Table 3: VRAM Usage Comparison ---
+    if vram_data:
+        vram_versions = sorted(vram_data.keys())
+        vram_T = set()
+        for v_data in vram_data.values():
+            vram_T.update(v_data.keys())
+        vram_T_values = sorted(vram_T)
+
+        vram_col_spec = "r" + "r" * len(vram_versions)
+        vram_header = r"    $T$ & " + " & ".join([version_headers.get(v, v) for v in vram_versions]) + r" \\"
+
+        latex_lines.append(r"% VRAM Usage Comparison Table")
+        latex_lines.append(r"\begin{table}[htbp]")
+        latex_lines.append(r"  \centering")
+        latex_lines.append(r"  \caption{Peak VRAM Usage (MB) Across Cache Configurations}")
+        latex_lines.append(r"  \label{tab:vram_usage}")
+        latex_lines.append(r"  \begin{tabular}{" + vram_col_spec + r"}")
+        latex_lines.append(r"    \toprule")
+        latex_lines.append(vram_header)
+        latex_lines.append(r"    \midrule")
+
+        for T in vram_T_values:
+            row_values = [str(T)]
+            for v in vram_versions:
+                if v in vram_data and T in vram_data[v]:
+                    val = vram_data[v][T]['peak_memory_bytes'] / 1e6
+                    row_values.append(f"{val:.1f}")
+                else:
+                    row_values.append("--")
+            latex_lines.append("    " + " & ".join(row_values) + r" \\")
+
+        latex_lines.append(r"    \bottomrule")
+        latex_lines.append(r"  \end{tabular}")
+        latex_lines.append(r"\end{table}")
+        latex_lines.append("")
+
+    # --- Table 4: Summary Statistics ---
+    latex_lines.append(r"% Summary Statistics Table")
+    latex_lines.append(r"\begin{table}[htbp]")
+    latex_lines.append(r"  \centering")
+    latex_lines.append(r"  \caption{Performance Summary at $T=1024$ Tokens}")
+    latex_lines.append(r"  \label{tab:summary}")
+    latex_lines.append(r"  \begin{tabular}{lrrrr}")
+    latex_lines.append(r"    \toprule")
+    latex_lines.append(r"    Configuration & Latency (ms) & Per-Token (ms) & Throughput (tok/s) & VRAM (MB) \\")
+    latex_lines.append(r"    \midrule")
+
+    T_summary = 1024
+    for v in versions:
+        label = version_headers.get(v, v)
+        if v in latency_data and T_summary in latency_data[v]:
+            lat = latency_data[v][T_summary]
+            total_ms = lat['time_total_ms_median']
+            per_tok_ms = lat['time_per_token_ms_median']
+            throughput = 1000.0 / per_tok_ms
+
+            if v in vram_data and T_summary in vram_data[v]:
+                vram_mb = vram_data[v][T_summary]['peak_memory_bytes'] / 1e6
+                vram_str = f"{vram_mb:.1f}"
+            else:
+                vram_str = "--"
+
+            latex_lines.append(f"    {label} & {total_ms:.1f} & {per_tok_ms:.2f} & {throughput:.1f} & {vram_str} \\\\")
+
+    latex_lines.append(r"    \bottomrule")
+    latex_lines.append(r"  \end{tabular}")
+    latex_lines.append(r"\end{table}")
+    latex_lines.append("")
+
+    # --- Table 5: Speedup Table (relative to v0) ---
+    if 'v0' in latency_data:
+        latex_lines.append(r"% Speedup Table (relative to No Cache baseline)")
+        latex_lines.append(r"\begin{table}[htbp]")
+        latex_lines.append(r"  \centering")
+        latex_lines.append(r"  \caption{Speedup Factor Relative to No-Cache Baseline}")
+        latex_lines.append(r"  \label{tab:speedup}")
+
+        other_versions = [v for v in versions if v != 'v0']
+        speedup_col_spec = "r" + "r" * len(other_versions)
+        speedup_header = r"    $T$ & " + " & ".join([version_headers.get(v, v) for v in other_versions]) + r" \\"
+
+        latex_lines.append(r"  \begin{tabular}{" + speedup_col_spec + r"}")
+        latex_lines.append(r"    \toprule")
+        latex_lines.append(speedup_header)
+        latex_lines.append(r"    \midrule")
+
+        for T in T_values:
+            if T not in latency_data['v0']:
+                continue
+            v0_time = latency_data['v0'][T]['time_total_ms_median']
+            row_values = [str(T)]
+            for v in other_versions:
+                if v in latency_data and T in latency_data[v]:
+                    v_time = latency_data[v][T]['time_total_ms_median']
+                    speedup = v0_time / v_time
+                    row_values.append(f"{speedup:.2f}$\\times$")
+                else:
+                    row_values.append("--")
+            latex_lines.append("    " + " & ".join(row_values) + r" \\")
+
+        latex_lines.append(r"    \bottomrule")
+        latex_lines.append(r"  \end{tabular}")
+        latex_lines.append(r"\end{table}")
+        latex_lines.append("")
+
+    # --- Table 6: Scaling Analysis Table ---
+    # Shows O(T²) coefficient, O(T) coefficient, R², and scaling class
+    latex_lines.append(r"% Scaling Analysis Table")
+    latex_lines.append(r"\begin{table}[htbp]")
+    latex_lines.append(r"  \centering")
+    latex_lines.append(r"  \caption{Latency Scaling Analysis (Quadratic Fit: $aT^2 + bT + c$)}")
+    latex_lines.append(r"  \label{tab:scaling}")
+    latex_lines.append(r"  \begin{tabular}{lrrrl}")
+    latex_lines.append(r"    \toprule")
+    latex_lines.append(r"    Configuration & $a$ ($\times 10^{-3}$) & $b$ & $R^2$ & Scaling \\")
+    latex_lines.append(r"    \midrule")
+
+    for v in versions:
+        label = version_headers.get(v, v)
+        v_data = sorted(latency_data[v].values(), key=lambda x: x['T'])
+        if len(v_data) < 3:
+            continue  # Need at least 3 points for quadratic fit
+
+        T_vals = [d['T'] for d in v_data]
+        total_ms = [d['time_total_ms_median'] for d in v_data]
+
+        a, b, c = quadratic_fit(T_vals, total_ms)
+        T_dense = np.asarray(T_vals, dtype=float)
+        y_pred = a * T_dense**2 + b * T_dense + c
+        r2 = r2_score(total_ms, y_pred)
+
+        # Classify scaling behavior
+        if abs(a) < 1e-5:
+            scaling_class = r"$\approx O(T)$"
+        elif a > 0:
+            scaling_class = r"$O(T^2)$"
+        else:
+            scaling_class = r"sub-linear"
+
+        latex_lines.append(f"    {label} & {a*1000:.3f} & {b:.2f} & {r2:.3f} & {scaling_class} \\\\")
+
+    latex_lines.append(r"    \bottomrule")
+    latex_lines.append(r"  \end{tabular}")
+    latex_lines.append(r"\end{table}")
+    latex_lines.append("")
+
+    # --- Table 7: Statistical Summary Table ---
+    # Shows Mean ± CI, Min, Max, CV% for each version
+    latex_lines.append(r"% Statistical Summary Table")
+    latex_lines.append(r"\begin{table}[htbp]")
+    latex_lines.append(r"  \centering")
+    latex_lines.append(r"  \caption{Per-Token Latency Statistics Across All $T$ Values}")
+    latex_lines.append(r"  \label{tab:stats}")
+    latex_lines.append(r"  \begin{tabular}{lrrrr}")
+    latex_lines.append(r"    \toprule")
+    latex_lines.append(r"    Configuration & Mean (ms) & Min (ms) & Max (ms) & CV (\%) \\")
+    latex_lines.append(r"    \midrule")
+
+    for v in versions:
+        label = version_headers.get(v, v)
+        v_data = list(latency_data[v].values())
+        if not v_data:
+            continue
+
+        per_tok_vals = [d['time_per_token_ms_median'] for d in v_data]
+        mean_val = np.mean(per_tok_vals)
+        min_val = np.min(per_tok_vals)
+        max_val = np.max(per_tok_vals)
+        std_val = np.std(per_tok_vals)
+        cv_pct = (std_val / mean_val * 100) if mean_val > 0 else 0
+
+        latex_lines.append(f"    {label} & {mean_val:.2f} & {min_val:.2f} & {max_val:.2f} & {cv_pct:.1f} \\\\")
+
+    latex_lines.append(r"    \bottomrule")
+    latex_lines.append(r"  \end{tabular}")
+    latex_lines.append(r"\end{table}")
+    latex_lines.append("")
+
+    # --- Table 8: Perplexity Comparison Table ---
+    perplexity_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'perplexity':
+            if data:
+                perplexity_data[version] = data[-1]
+
+    if perplexity_data:
+        ppl_versions = sorted(perplexity_data.keys())
+        baseline_ppl = perplexity_data.get('v0', {}).get('perplexity', None)
+
+        latex_lines.append(r"% Perplexity Comparison Table")
+        latex_lines.append(r"\begin{table}[htbp]")
+        latex_lines.append(r"  \centering")
+        latex_lines.append(r"  \caption{Perplexity on WikiText-2 (Lower is Better)}")
+        latex_lines.append(r"  \label{tab:perplexity}")
+        latex_lines.append(r"  \begin{tabular}{lrrr}")
+        latex_lines.append(r"    \toprule")
+        latex_lines.append(r"    Configuration & Perplexity & Degradation (\%) & Tokens Evaluated \\")
+        latex_lines.append(r"    \midrule")
+
+        for v in ppl_versions:
+            label = version_headers.get(v, v)
+            ppl = perplexity_data[v]['perplexity']
+            n_tokens = perplexity_data[v].get('num_tokens_evaluated', '--')
+
+            if baseline_ppl and v != 'v0':
+                deg = ((ppl - baseline_ppl) / baseline_ppl) * 100
+                deg_str = f"{deg:+.3f}"
+            elif v == 'v0':
+                deg_str = "baseline"
+            else:
+                deg_str = "--"
+
+            n_tok_str = f"{n_tokens:,}" if isinstance(n_tokens, int) else str(n_tokens)
+            latex_lines.append(f"    {label} & {ppl:.2f} & {deg_str} & {n_tok_str} \\\\")
+
+        latex_lines.append(r"    \bottomrule")
+        latex_lines.append(r"  \end{tabular}")
+        latex_lines.append(r"\end{table}")
+
+    # Write to file
+    latex_content = "\n".join(latex_lines)
+    out_path = Path(output_dir) / 'benchmark_tables.tex'
+    with open(out_path, 'w') as f:
+        f.write(latex_content)
+    print(f"  Saved: {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate professional plots from nanoGPT benchmark results."
@@ -812,6 +1746,30 @@ def main():
     print("\nGenerating comparison plots...")
     plot_latency_comparison(results, output_dir)
     plot_vram_comparison(results, output_dir)
+
+    # New comparison plots
+    print("\nGenerating additional comparison plots...")
+    plot_throughput_comparison(results, output_dir)
+    plot_memory_efficiency_comparison(results, output_dir)
+
+    # Plots with 95% confidence intervals
+    print("\nGenerating plots with 95% confidence intervals...")
+    plot_latency_comparison_with_ci(results, output_dir)
+    plot_total_latency_comparison_with_ci(results, output_dir)
+    plot_throughput_comparison_with_ci(results, output_dir)
+
+    # Pareto plot (memory vs latency tradeoff)
+    print("\nGenerating Pareto plot...")
+    plot_pareto_memory_latency(results, output_dir)
+
+    # Perplexity plots
+    print("\nGenerating perplexity plots...")
+    plot_perplexity_comparison(results, output_dir)
+    plot_perplexity_degradation(results, output_dir)
+
+    # Export LaTeX tables
+    print("\nExporting LaTeX tables...")
+    export_latex_tables(results, output_dir)
 
     print()
     print(f"All plots saved to {output_dir}")
