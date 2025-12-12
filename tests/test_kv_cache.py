@@ -378,12 +378,164 @@ def test_cross_layer_long_generation():
     return True
 
 
+def test_v2_int8_quantization_only():
+    """Test v2: INT8 quantization without cross-layer sharing."""
+    print("Test 15: V2 INT8 quantization (isolated)...")
+
+    config = GPTConfig(
+        n_layer=4, n_head=4, n_embd=128,
+        block_size=256, vocab_size=50257, dropout=0.0,
+        kv_cache_quant=True, cross_layer_sharing=False
+    )
+    model = GPT(config).eval()
+    prompt = torch.randint(0, 50257, (1, 10))
+
+    with torch.no_grad():
+        _, _, cache = model(prompt, use_cache=True)
+
+    # Should have cache for all layers (no cross-layer sharing)
+    assert len(cache) == config.n_layer, f"Expected {config.n_layer} caches, got {len(cache)}"
+
+    # All caches should be quantized (tuple of tuples)
+    for i, (k, v) in enumerate(cache):
+        assert isinstance(k, tuple) and len(k) == 2, f"Cache {i} K should be quantized tuple"
+        assert isinstance(v, tuple) and len(v) == 2, f"Cache {i} V should be quantized tuple"
+        assert k[0].dtype == torch.int8, f"Cache {i} K[0] should be int8"
+        assert v[0].dtype == torch.int8, f"Cache {i} V[0] should be int8"
+
+    # Verify generation works
+    torch.manual_seed(42)
+    out = model.generate(prompt.clone(), max_new_tokens=20, use_cache=True)
+    assert out.shape[1] == 30, f"Expected 30 tokens, got {out.shape[1]}"
+
+    print("  PASSED")
+    return True
+
+
+def test_v3_cross_layer_sharing_only():
+    """Test v3: Cross-layer sharing without INT8 quantization."""
+    print("Test 16: V3 Cross-layer sharing (isolated)...")
+
+    config = GPTConfig(
+        n_layer=4, n_head=4, n_embd=128,
+        block_size=256, vocab_size=50257, dropout=0.0,
+        kv_cache_quant=False, cross_layer_sharing=True
+    )
+    model = GPT(config).eval()
+    prompt = torch.randint(0, 50257, (1, 10))
+
+    with torch.no_grad():
+        _, _, cache = model(prompt, use_cache=True)
+
+    # Should have half the caches (cross-layer sharing)
+    expected_cache_len = config.n_layer // 2
+    assert len(cache) == expected_cache_len, f"Expected {expected_cache_len} caches, got {len(cache)}"
+
+    # Caches should NOT be quantized (just tensors, not tuples)
+    for i, (k, v) in enumerate(cache):
+        assert isinstance(k, torch.Tensor), f"Cache {i} K should be tensor (not quantized)"
+        assert isinstance(v, torch.Tensor), f"Cache {i} V should be tensor (not quantized)"
+        assert k.dtype != torch.int8, f"Cache {i} K should not be int8"
+        assert v.dtype != torch.int8, f"Cache {i} V should not be int8"
+
+    # Verify generation works
+    torch.manual_seed(42)
+    out = model.generate(prompt.clone(), max_new_tokens=20, use_cache=True)
+    assert out.shape[1] == 30, f"Expected 30 tokens, got {out.shape[1]}"
+
+    print("  PASSED")
+    return True
+
+
+def test_v2_generation_correctness():
+    """V2 (INT8 quant) generation should be numerically close to V1."""
+    print("Test 17: V2 generation correctness vs V1...")
+
+    # V1 config (no quant)
+    config_v1 = GPTConfig(
+        n_layer=2, n_head=2, n_embd=64,
+        block_size=128, vocab_size=50257, dropout=0.0,
+        kv_cache_quant=False, cross_layer_sharing=False
+    )
+    model_v1 = GPT(config_v1).eval()
+
+    # V2 config (with quant) - same weights
+    config_v2 = GPTConfig(
+        n_layer=2, n_head=2, n_embd=64,
+        block_size=128, vocab_size=50257, dropout=0.0,
+        kv_cache_quant=True, cross_layer_sharing=False
+    )
+    model_v2 = GPT(config_v2).eval()
+
+    # Copy weights from v1 to v2
+    model_v2.load_state_dict(model_v1.state_dict())
+
+    prompt = torch.randint(0, 50257, (1, 5))
+
+    with torch.no_grad():
+        # Forward pass WITH cache to exercise quantization
+        logits_v1, _, cache_v1 = model_v1(prompt, use_cache=True)
+        logits_v2, _, cache_v2 = model_v2(prompt, use_cache=True)
+
+    # Verify v2 cache is actually quantized
+    assert isinstance(cache_v2[0][0], tuple), "V2 cache K should be quantized (tuple format)"
+    assert cache_v2[0][0][0].dtype == torch.int8, "V2 cache K data should be int8"
+
+    # Verify v1 cache is NOT quantized
+    assert isinstance(cache_v1[0][0], torch.Tensor), "V1 cache K should be plain tensor"
+    assert cache_v1[0][0].dtype != torch.int8, "V1 cache K should not be int8"
+
+    # Logits should be close (allowing for quantization error)
+    max_diff = (logits_v1 - logits_v2).abs().max().item()
+    assert max_diff < 0.5, f"V1 vs V2 logits differ by {max_diff} (expected < 0.5 for quantization)"
+
+    print("  PASSED")
+    return True
+
+
+def test_v3_generation_correctness():
+    """V3 (cross-layer) generation should produce valid output."""
+    print("Test 18: V3 generation correctness...")
+
+    config = GPTConfig(
+        n_layer=4, n_head=4, n_embd=128,
+        block_size=128, vocab_size=50257, dropout=0.0,
+        kv_cache_quant=False, cross_layer_sharing=True
+    )
+    model = GPT(config).eval()
+
+    prompt = torch.randint(0, 50257, (1, 10))
+
+    # Generate with cross-layer sharing
+    torch.manual_seed(42)
+    out_cls = model.generate(prompt.clone(), max_new_tokens=30, use_cache=True,
+                             cross_layer_sharing=True)
+
+    # Generate without cross-layer sharing (same model, different runtime setting)
+    torch.manual_seed(42)
+    out_normal = model.generate(prompt.clone(), max_new_tokens=30, use_cache=True,
+                                cross_layer_sharing=False)
+
+    # Both should produce valid outputs of correct length
+    assert out_cls.shape[1] == 40, f"CLS output wrong length: {out_cls.shape[1]}"
+    assert out_normal.shape[1] == 40, f"Normal output wrong length: {out_normal.shape[1]}"
+
+    # Note: Outputs may differ because cross-layer sharing changes computation
+    # But both should be valid (no NaN, no errors)
+    assert not torch.isnan(out_cls).any(), "Cross-layer sharing produced NaN"
+    assert not torch.isnan(out_normal).any(), "Normal generation produced NaN"
+
+    print("  PASSED")
+    return True
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("KV-Cache Tests")
     print("=" * 50)
 
     tests = [
+        # Core KV-cache tests
         test_cache_correctness,
         test_training_compat,
         test_cache_shapes,
@@ -395,9 +547,16 @@ if __name__ == "__main__":
         test_long_generation,
         test_single_token_prompt,
         test_cache_reuse_across_calls,
+        # V4 combined test
         test_grand_slam_cache_types,
+        # V3 cross-layer tests
         test_cross_layer_cache_size,
         test_cross_layer_long_generation,
+        # Isolated v2/v3 tests
+        test_v2_int8_quantization_only,
+        test_v3_cross_layer_sharing_only,
+        test_v2_generation_correctness,
+        test_v3_generation_correctness,
     ]
 
     passed = 0
@@ -410,6 +569,8 @@ if __name__ == "__main__":
                 failed += 1
         except Exception as e:
             print(f"  FAILED: {e}")
+            import traceback
+            traceback.print_exc()
             failed += 1
 
     print("=" * 50)
