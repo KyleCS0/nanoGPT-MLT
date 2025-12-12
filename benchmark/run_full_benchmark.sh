@@ -44,6 +44,7 @@ SKIP_BENCHMARK=false
 SKIP_PERPLEXITY=false
 RUN_ROOFLINE=false
 CONFIG="benchmark/config.yaml"
+MODEL_PRESET="gpt2-medium"  # Must match config.yaml pretrained setting
 
 # =============================================================================
 # Argument Parsing
@@ -113,6 +114,7 @@ echo -e "${BOLD}============================================================${NC
 echo ""
 echo "  Project root:    $PROJECT_ROOT"
 echo "  Config file:     $CONFIG"
+echo "  Model:           $MODEL_PRESET"
 echo "  Versions:        $VERSIONS"
 echo "  Clean first:     $CLEAN"
 echo "  Skip benchmark:  $SKIP_BENCHMARK"
@@ -235,6 +237,14 @@ if [ "$SKIP_BENCHMARK" = false ]; then
     echo ""
     run_python benchmark/main.py phase --version $VERSIONS --config "$CONFIG"
 
+    # -------------------------------------------------------------------------
+    # Max Batch Capacity Benchmark
+    # -------------------------------------------------------------------------
+    log_section "Max Batch Capacity Benchmark"
+    log_info "Finding maximum batch size before OOM for each version"
+    echo ""
+    run_python benchmark/main.py capacity --version $VERSIONS --config "$CONFIG"
+
     log_success "Main benchmarks complete!"
 
 else
@@ -252,7 +262,7 @@ if [ "$SKIP_PERPLEXITY" = false ]; then
     echo ""
 
     # Run perplexity for all versions (autoregressive mode to test cache)
-    run_python benchmark/perplexity.py --autoregressive --version $VERSIONS
+    run_python benchmark/perplexity.py --autoregressive --preset "$MODEL_PRESET" --version $VERSIONS
 
     log_success "Perplexity evaluation complete!"
 else
@@ -273,8 +283,8 @@ if [ "$RUN_ROOFLINE" = true ]; then
         log_info "This profiles GPU compute vs memory bottlenecks"
         echo ""
 
-        # Run roofline script
-        bash benchmark/roofline/run_ncu.sh
+        # Run roofline script with model preset
+        bash benchmark/roofline/run_ncu.sh --model "$MODEL_PRESET"
 
         log_success "Roofline profiling complete!"
         log_info "Reports saved to benchmark/roofline/ncu_reports/"

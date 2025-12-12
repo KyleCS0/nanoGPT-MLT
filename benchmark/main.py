@@ -515,6 +515,124 @@ def run_per_phase_timing(config):
         del model
         torch.cuda.empty_cache()
 
+
+def run_max_batch_capacity(config):
+    """
+    Benchmark maximum batch size capacity for inference (generation).
+
+    For each version, finds the maximum batch size that can successfully
+    generate T tokens without OOM. Uses binary search for efficiency.
+
+    This benchmark measures inference capacity, NOT training capacity
+    (no backward pass/gradients involved).
+    """
+    print("Running Max Batch Capacity benchmark...")
+
+    versions = config.get('versions', ['v0', 'v1'])
+    pretrained = config.get('pretrained', 'gpt2')
+    dtype_str = config['dtype']
+    # Use a fixed T for capacity testing (configurable via capacity_T in config)
+    T = config.get('capacity_T', 128)
+    prompt_length = config['prompt_length']
+
+    for version in versions:
+        print(f"\n  Version: {version}")
+
+        # Start fresh for each version
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        # Load model
+        model, v_config = load_model_for_version(version, pretrained, dtype_str)
+        model_config_dict = get_model_config_dict(model)
+        vocab_size = model.config.vocab_size
+
+        use_cache = v_config['use_cache']
+        cross_layer_sharing = v_config['cross_layer_sharing']
+        desc = v_config['description']
+
+        print(f"    use_cache={use_cache}, kv_cache_quant={v_config['kv_cache_quant']}, cross_layer_sharing={cross_layer_sharing}")
+        print(f"    Testing with T={T} tokens generation...")
+
+        # Binary search for max batch size
+        # Start with known-safe range
+        low = 1
+        high = 2  # Will expand if needed
+        max_successful_batch = 0
+
+        # First, exponentially expand high until we hit OOM
+        print(f"    Phase 1: Finding upper bound...")
+        while True:
+            torch.cuda.empty_cache()
+            try:
+                prompt = torch.randint(0, vocab_size, (high, prompt_length), device="cuda")
+                with torch.no_grad():
+                    _ = model.generate(prompt, max_new_tokens=T, use_cache=use_cache,
+                                      cross_layer_sharing=cross_layer_sharing)
+                torch.cuda.synchronize()
+                max_successful_batch = high
+                print(f"      batch_size={high}: OK")
+                low = high
+                high *= 2
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    print(f"      batch_size={high}: OOM")
+                    break
+                else:
+                    raise e
+
+        # Binary search between low and high
+        print(f"    Phase 2: Binary search in [{low}, {high}]...")
+        while low < high - 1:
+            mid = (low + high) // 2
+            torch.cuda.empty_cache()
+            try:
+                prompt = torch.randint(0, vocab_size, (mid, prompt_length), device="cuda")
+                with torch.no_grad():
+                    _ = model.generate(prompt, max_new_tokens=T, use_cache=use_cache,
+                                      cross_layer_sharing=cross_layer_sharing)
+                torch.cuda.synchronize()
+                max_successful_batch = mid
+                print(f"      batch_size={mid}: OK")
+                low = mid
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+                    print(f"      batch_size={mid}: OOM")
+                    high = mid
+                else:
+                    raise e
+
+        # Final verification run to get memory stats
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        prompt = torch.randint(0, vocab_size, (max_successful_batch, prompt_length), device="cuda")
+        with torch.no_grad():
+            _ = model.generate(prompt, max_new_tokens=T, use_cache=use_cache,
+                              cross_layer_sharing=cross_layer_sharing)
+        torch.cuda.synchronize()
+        peak_memory_bytes = torch.cuda.max_memory_allocated()
+
+        result = {
+            'benchmark_name': 'max_batch_capacity',
+            'version': version,
+            'version_description': desc,
+            'use_cache': use_cache,
+            'kv_cache_quant': v_config['kv_cache_quant'],
+            'cross_layer_sharing': cross_layer_sharing,
+            'capacity_T': T,
+            'max_batch_size': max_successful_batch,
+            'peak_memory_bytes': peak_memory_bytes,
+            'peak_memory_gb': peak_memory_bytes / 1e9,
+        }
+        log_result(config, result, model_config_dict)
+
+        print(f"    Maximum batch size: {max_successful_batch}")
+        print(f"    Peak memory at max batch: {peak_memory_bytes / 1e9:.2f} GB")
+
+        del model
+        torch.cuda.empty_cache()
+
+
 def main():
     # Build version choices and help from registry
     available_versions = list(VERSIONS.keys())
@@ -532,7 +650,7 @@ Examples:
     python benchmark/main.py vram --version v1 v3 v4   # Compare memory optimization versions
         """
     )
-    parser.add_argument('benchmark', nargs='*', help="Benchmark(s) to run: latency, vram, phase, all", default=['all'])
+    parser.add_argument('benchmark', nargs='*', help="Benchmark(s) to run: latency, vram, phase, capacity, all", default=['all'])
     parser.add_argument('--config', type=str, default='benchmark/config.yaml', help='Path to the config file.')
     parser.add_argument('--clear-log', action='store_true', help='Clear the results log file before running benchmarks.')
     parser.add_argument('--preset', type=str, choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'],
@@ -589,6 +707,8 @@ Examples:
         run_vram_vs_T(config)
     if 'all' in args.benchmark or 'phase' in args.benchmark:
         run_per_phase_timing(config)
+    if 'all' in args.benchmark or 'capacity' in args.benchmark:
+        run_max_batch_capacity(config)
 
     print("\n" + "=" * 60)
     print("Benchmarking complete!")

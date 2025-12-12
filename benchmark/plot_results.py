@@ -1383,6 +1383,129 @@ def plot_perplexity_degradation(results, output_dir):
     plt.close()
 
 
+def plot_max_batch_capacity(results, output_dir):
+    """
+    Plot maximum batch size capacity comparison across versions as a bar chart.
+
+    This shows the maximum batch size each version can handle for inference
+    without running out of memory.
+    """
+    # Collect capacity data
+    capacity_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'max_batch_capacity':
+            if data:
+                # Take the latest record for each version
+                capacity_data[version] = data[-1]
+
+    if not capacity_data:
+        print("  No max_batch_capacity data found. Skipping capacity plot.")
+        return
+
+    # Sort versions
+    versions = sorted(capacity_data.keys())
+    max_batches = [capacity_data[v]['max_batch_size'] for v in versions]
+    peak_memory_gb = [capacity_data[v].get('peak_memory_gb', 0) for v in versions]
+
+    # Get baseline (v0) for comparison
+    baseline_batch = capacity_data.get('v0', {}).get('max_batch_size', max_batches[0])
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Create bar chart
+    x_pos = np.arange(len(versions))
+    colors = [VERSION_COLORS.get(v, '#666666') for v in versions]
+
+    bars = ax.bar(x_pos, max_batches, color=colors, edgecolor='black', linewidth=1.2)
+
+    # Add value labels on bars
+    for i, (bar, batch, mem) in enumerate(zip(bars, max_batches, peak_memory_gb)):
+        height = bar.get_height()
+        # Calculate improvement from baseline
+        if baseline_batch > 0 and versions[i] != 'v0':
+            improvement = ((batch - baseline_batch) / baseline_batch) * 100
+            imp_str = f"\n({improvement:+.1f}%)"
+        elif versions[i] == 'v0':
+            imp_str = "\n(baseline)"
+        else:
+            imp_str = ""
+        ax.annotate(f'{batch}{imp_str}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    # Labels
+    version_labels = [get_cache_label(v) for v in versions]
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(version_labels, rotation=15, ha='right')
+
+    ax.set_xlabel('Version', fontweight='bold')
+    ax.set_ylabel('Maximum Batch Size', fontweight='bold')
+
+    # Get capacity_T from data
+    capacity_T = capacity_data[versions[0]].get('capacity_T', 128)
+    ax.set_title(f'Maximum Inference Batch Size by Version (T={capacity_T})', fontweight='bold', pad=15)
+    ax.grid(True, linestyle='--', alpha=0.3, axis='y')
+
+    # Set y-axis to start at 0
+    ax.set_ylim(bottom=0, top=max(max_batches) * 1.2)
+
+    # Add annotation about what this measures
+    ax.annotate('Higher is better\n(more parallel sequences)',
+                xy=(0.98, 0.98), xycoords='axes fraction',
+                fontsize=9, ha='right', va='top', style='italic', color='#555555',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='wheat', alpha=0.5))
+
+    # Add system info
+    first_data = next(iter(capacity_data.values()))
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data.get('gpu_name', 'N/A')} | "
+             f"Prompt Length: {first_data.get('prompt_length', 'N/A')} | "
+             f"dtype: {first_data.get('dtype', 'N/A')}",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_max_batch_capacity.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+    # --- Secondary plot: Memory at Max Batch ---
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+
+    bars2 = ax2.bar(x_pos, peak_memory_gb, color=colors, edgecolor='black', linewidth=1.2)
+
+    # Add value labels
+    for bar, mem in zip(bars2, peak_memory_gb):
+        height = bar.get_height()
+        ax2.annotate(f'{mem:.2f} GB',
+                     xy=(bar.get_x() + bar.get_width() / 2, height),
+                     xytext=(0, 3),
+                     textcoords="offset points",
+                     ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(version_labels, rotation=15, ha='right')
+
+    ax2.set_xlabel('Version', fontweight='bold')
+    ax2.set_ylabel('Peak Memory at Max Batch (GB)', fontweight='bold')
+    ax2.set_title(f'Peak Memory Usage at Maximum Batch Size (T={capacity_T})', fontweight='bold', pad=15)
+    ax2.grid(True, linestyle='--', alpha=0.3, axis='y')
+    ax2.set_ylim(bottom=0)
+
+    fig2.text(0.5, 0.02,
+              f"GPU: {first_data.get('gpu_name', 'N/A')} | "
+              f"Shows memory used when running at max capacity",
+              ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path2 = Path(output_dir) / 'comparison_peak_memory_at_max_batch.png'
+    plt.savefig(path2, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path2}")
+    plt.close()
+
+
 def export_latex_tables(results, output_dir):
     """
     Export publication-ready LaTeX tables for benchmark results.
@@ -1801,6 +1924,10 @@ def main():
     print("\nGenerating perplexity plots...")
     plot_perplexity_comparison(results, output_dir)
     plot_perplexity_degradation(results, output_dir)
+
+    # Max batch capacity plots
+    print("\nGenerating max batch capacity plots...")
+    plot_max_batch_capacity(results, output_dir)
 
     # Export LaTeX tables
     print("\nExporting LaTeX tables...")
