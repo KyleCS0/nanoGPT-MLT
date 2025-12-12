@@ -14,8 +14,8 @@ prompt_length: 32
 # More T values for smoother curves and clearer scaling (up to context limit)
 T_values: [32, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024]
 batch_size: 1
-num_warmup_runs: 3
-num_measure_runs: 10
+num_warmup_runs: 10
+num_measure_runs: 20
 T_star: 512 # For per-phase timing
 seed: 1337
 
