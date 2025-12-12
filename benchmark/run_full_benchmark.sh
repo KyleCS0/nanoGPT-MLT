@@ -134,14 +134,17 @@ fi
 ACTUAL_USER="${SUDO_USER:-$USER}"
 log_info "Running as root, Python will execute as: $ACTUAL_USER"
 
-# Detect Python path from the calling environment
-if [ -n "$SUDO_USER" ] && [ -n "$(which python 2>/dev/null)" ]; then
-    PYTHON_PATH="$(which python)"
-elif [ -n "$CONDA_PREFIX" ]; then
-    PYTHON_PATH="$CONDA_PREFIX/bin/python"
-else
-    # Try to get Python from the user's environment
-    PYTHON_PATH=$(sudo -u "$ACTUAL_USER" bash -lc 'which python' 2>/dev/null || echo "python")
+# Detect Python path - sudo doesn't preserve PATH/CONDA_PREFIX
+# Allow override via PYTHON_PATH environment variable
+if [ -z "$PYTHON_PATH" ]; then
+    # Try common conda locations for this user
+    CONDA_PYTHON="/local/$ACTUAL_USER/conda_envs/nanogpt/bin/python"
+    if [ -x "$CONDA_PYTHON" ]; then
+        PYTHON_PATH="$CONDA_PYTHON"
+    else
+        # Fallback: ask the user's shell for Python location
+        PYTHON_PATH=$(sudo -u "$ACTUAL_USER" bash -lc 'which python' 2>/dev/null || echo "python3")
+    fi
 fi
 log_info "Using Python: $PYTHON_PATH"
 
