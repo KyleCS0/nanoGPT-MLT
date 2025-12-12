@@ -134,8 +134,23 @@ fi
 ACTUAL_USER="${SUDO_USER:-$USER}"
 log_info "Running as root, Python will execute as: $ACTUAL_USER"
 
+# Detect Python path from the calling environment
+if [ -n "$SUDO_USER" ] && [ -n "$(which python 2>/dev/null)" ]; then
+    PYTHON_PATH="$(which python)"
+elif [ -n "$CONDA_PREFIX" ]; then
+    PYTHON_PATH="$CONDA_PREFIX/bin/python"
+else
+    # Try to get Python from the user's environment
+    PYTHON_PATH=$(sudo -u "$ACTUAL_USER" bash -lc 'which python' 2>/dev/null || echo "python")
+fi
+log_info "Using Python: $PYTHON_PATH"
+
 run_as_user() {
     sudo -u "$ACTUAL_USER" "$@"
+}
+
+run_python() {
+    sudo -u "$ACTUAL_USER" "$PYTHON_PATH" "$@"
 }
 
 # =============================================================================
@@ -199,7 +214,7 @@ if [ "$SKIP_BENCHMARK" = false ]; then
     log_section "Latency vs T Benchmark"
     log_info "Measuring generation latency across different sequence lengths"
     echo ""
-    run_as_user python benchmark/main.py latency --version $VERSIONS --config "$CONFIG" --clear-log
+    run_python benchmark/main.py latency --version $VERSIONS --config "$CONFIG" --clear-log
 
     # -------------------------------------------------------------------------
     # VRAM vs T Benchmark
@@ -207,7 +222,7 @@ if [ "$SKIP_BENCHMARK" = false ]; then
     log_section "VRAM vs T Benchmark"
     log_info "Measuring peak memory usage across different sequence lengths"
     echo ""
-    run_as_user python benchmark/main.py vram --version $VERSIONS --config "$CONFIG"
+    run_python benchmark/main.py vram --version $VERSIONS --config "$CONFIG"
 
     # -------------------------------------------------------------------------
     # Per-Phase Timing Benchmark
@@ -215,7 +230,7 @@ if [ "$SKIP_BENCHMARK" = false ]; then
     log_section "Per-Phase Timing Benchmark"
     log_info "Measuring time spent in each model phase (embedding, attention, MLP, head)"
     echo ""
-    run_as_user python benchmark/main.py phase --version $VERSIONS --config "$CONFIG"
+    run_python benchmark/main.py phase --version $VERSIONS --config "$CONFIG"
 
     log_success "Main benchmarks complete!"
 
@@ -234,7 +249,7 @@ if [ "$SKIP_PERPLEXITY" = false ]; then
     echo ""
 
     # Run perplexity for all versions (autoregressive mode to test cache)
-    run_as_user python benchmark/perplexity.py --autoregressive --version $VERSIONS
+    run_python benchmark/perplexity.py --autoregressive --version $VERSIONS
 
     log_success "Perplexity evaluation complete!"
 else
@@ -270,7 +285,7 @@ log_section "Generating Plots"
 log_info "Creating visualizations from benchmark results"
 echo ""
 
-run_as_user python benchmark/plot_results.py \
+run_python benchmark/plot_results.py \
     --results benchmark/results.jsonl \
     --output-dir benchmark/plots
 
