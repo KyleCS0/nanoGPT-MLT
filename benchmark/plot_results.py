@@ -1832,6 +1832,365 @@ def export_latex_tables(results, output_dir):
     print(f"  Saved: {out_path}")
 
 
+# =============================================================================
+# Split Comparison Plots: v0 vs v1, and KV-cache variants (v1 vs v2/v3/v4)
+# =============================================================================
+
+def plot_v0_vs_v1_latency(results, output_dir):
+    """
+    Focused comparison: v0 (no cache) vs v1 (KV-cache).
+    Shows the fundamental O(T²) vs O(T) scaling difference.
+    """
+    latency_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T' and version in ('v0', 'v1'):
+            latency_data[version] = sorted(data, key=lambda x: x['T'])
+
+    if 'v0' not in latency_data or 'v1' not in latency_data:
+        print("  Need both v0 and v1 for v0 vs v1 comparison. Skipping.")
+        return
+
+    first_data = latency_data['v0'][0]
+
+    # --- Per-token latency: v0 vs v1 ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for version in ['v0', 'v1']:
+        data = latency_data[version]
+        T_values = [d['T'] for d in data]
+        time_per_token = [d['time_per_token_ms_median'] for d in data]
+        label = get_cache_label(version)
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+
+        ax.plot(T_values, time_per_token, f'{marker}-',
+                markersize=7, linewidth=2.5,
+                color=color, label=label)
+
+    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
+    ax.set_ylabel('Time per Token (ms)', fontweight='bold')
+    ax.set_title('KV-Cache Impact: O(T) → O(1) Per-Token Scaling', fontweight='bold', pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='upper left')
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    # Add scaling annotations
+    v0_T = [d['T'] for d in latency_data['v0']]
+    v0_pt = [d['time_per_token_ms_median'] for d in latency_data['v0']]
+    v1_pt = [d['time_per_token_ms_median'] for d in latency_data['v1']]
+
+    # Annotate at max T
+    max_idx = -1
+    ax.annotate(f'v0: {v0_pt[max_idx]:.1f} ms/tok',
+                xy=(v0_T[max_idx], v0_pt[max_idx]),
+                xytext=(v0_T[max_idx] - 150, v0_pt[max_idx] + 0.3),
+                fontsize=10, color=VERSION_COLORS['v0'], fontweight='bold',
+                arrowprops=dict(arrowstyle='->', color=VERSION_COLORS['v0']))
+    ax.annotate(f'v1: {v1_pt[max_idx]:.1f} ms/tok',
+                xy=(v0_T[max_idx], v1_pt[max_idx]),
+                xytext=(v0_T[max_idx] - 150, v1_pt[max_idx] - 0.5),
+                fontsize=10, color=VERSION_COLORS['v1'], fontweight='bold',
+                arrowprops=dict(arrowstyle='->', color=VERSION_COLORS['v1']))
+
+    # Add speedup annotation
+    speedup = v0_pt[max_idx] / v1_pt[max_idx]
+    ax.annotate(f'{speedup:.1f}x faster at T={v0_T[max_idx]}',
+                xy=(0.98, 0.5), xycoords='axes fraction',
+                fontsize=12, ha='right', va='center', fontweight='bold',
+                color=VERSION_COLORS['v1'],
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data['gpu_name']} | v0: no cache (recompute all) | v1: KV-cache (incremental)",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_v0_vs_v1_latency.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_kv_variants_latency(results, output_dir):
+    """
+    Compare KV-cache variants: v1 vs v2 vs v3 vs v4.
+    Excludes v0 to zoom in on the differences between cache implementations.
+    """
+    latency_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T' and version in ('v1', 'v2', 'v3', 'v4'):
+            latency_data[version] = sorted(data, key=lambda x: x['T'])
+
+    if len(latency_data) < 2:
+        print("  Need at least 2 KV-cache variants for comparison. Skipping.")
+        return
+
+    first_data = next(iter(latency_data.values()))[0]
+
+    # --- Per-token latency comparison ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for version in sorted(latency_data.keys()):
+        data = latency_data[version]
+        T_values = [d['T'] for d in data]
+        time_per_token = [d['time_per_token_ms_median'] for d in data]
+        label = get_cache_label(version)
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+
+        ax.plot(T_values, time_per_token, f'{marker}-',
+                markersize=6, linewidth=2,
+                color=color, label=label)
+
+    # Add horizontal reference line at v1 baseline
+    if 'v1' in latency_data:
+        v1_avg = np.mean([d['time_per_token_ms_median'] for d in latency_data['v1']])
+        ax.axhline(y=v1_avg, color=VERSION_COLORS['v1'], linestyle='--', linewidth=1.5, alpha=0.5)
+        ax.annotate(f'v1 avg: {v1_avg:.2f} ms', xy=(0.02, v1_avg),
+                    xycoords=('axes fraction', 'data'),
+                    fontsize=9, color=VERSION_COLORS['v1'], va='bottom')
+
+    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
+    ax.set_ylabel('Time per Token (ms)', fontweight='bold')
+    ax.set_title('KV-Cache Variants: Per-Token Latency Comparison', fontweight='bold', pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='upper right')
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data['gpu_name']} | Comparing KV-cache optimizations (v0 excluded for clarity)",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_kv_variants_latency.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_speedup_vs_v1(results, output_dir):
+    """
+    Plot relative speedup of KV-cache variants compared to v1 baseline.
+    Speedup > 1.0 means faster than v1, < 1.0 means slower.
+    """
+    latency_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T':
+            latency_data[version] = {d['T']: d['time_per_token_ms_median'] for d in data}
+
+    if 'v1' not in latency_data:
+        print("  Need v1 baseline for speedup comparison. Skipping.")
+        return
+
+    v1_data = latency_data['v1']
+    variants = [v for v in latency_data.keys() if v != 'v1' and v != 'v0']
+
+    if not variants:
+        print("  No KV-cache variants (v2, v3, v4) found. Skipping speedup plot.")
+        return
+
+    first_data_key = next(iter(results.keys()))
+    first_data = results[first_data_key][0]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for version in sorted(variants):
+        v_data = latency_data[version]
+        common_T = sorted(set(v1_data.keys()) & set(v_data.keys()))
+        if not common_T:
+            continue
+
+        # Speedup = v1_time / variant_time (>1 means variant is faster)
+        speedup = [v1_data[T] / v_data[T] for T in common_T]
+        label = get_cache_label(version)
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+
+        ax.plot(common_T, speedup, f'{marker}-',
+                markersize=6, linewidth=2,
+                color=color, label=label)
+
+    # Reference line at 1.0 (v1 baseline)
+    ax.axhline(y=1.0, color=VERSION_COLORS['v1'], linestyle='-', linewidth=2,
+               label='v1 baseline (1.0x)')
+
+    # Shade regions
+    T_range = ax.get_xlim()
+    ax.fill_between([T_range[0], T_range[1]], 1.0, 2.0,
+                    alpha=0.1, color='green', label='Faster than v1')
+    ax.fill_between([T_range[0], T_range[1]], 0, 1.0,
+                    alpha=0.1, color='red', label='Slower than v1')
+
+    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold')
+    ax.set_ylabel('Speedup vs v1 (higher = faster)', fontweight='bold')
+    ax.set_title('KV-Cache Variants: Speedup Relative to v1 Baseline', fontweight='bold', pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='upper right')
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data['gpu_name']} | Speedup = v1_latency / variant_latency",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'comparison_speedup_vs_v1.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_vram_bar_chart(results, output_dir):
+    """
+    Bar chart showing peak VRAM usage for each version.
+    More meaningful than delta plots for paper figures.
+    Shows baseline (T=32) and peak (max T) for each version.
+    """
+    vram_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'vram_vs_T':
+            sorted_data = sorted(data, key=lambda x: x['T'])
+            vram_data[version] = sorted_data
+
+    if not vram_data:
+        print("  No VRAM data found. Skipping VRAM bar chart.")
+        return
+
+    versions = sorted(vram_data.keys())
+    first_data = next(iter(vram_data.values()))[0]
+
+    # Extract baseline and peak for each version
+    baseline_mb = []
+    peak_mb = []
+    for v in versions:
+        data = vram_data[v]
+        baseline_mb.append(data[0]['peak_memory_bytes'] / 1e6)
+        peak_mb.append(data[-1]['peak_memory_bytes'] / 1e6)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    x = np.arange(len(versions))
+    width = 0.35
+
+    bars1 = ax.bar(x - width/2, baseline_mb, width, label=f'Baseline (T={vram_data[versions[0]][0]["T"]})',
+                   color='#2A9D8F', edgecolor='white', linewidth=1)
+    bars2 = ax.bar(x + width/2, peak_mb, width, label=f'Peak (T={vram_data[versions[0]][-1]["T"]})',
+                   color='#E63946', edgecolor='white', linewidth=1)
+
+    # Add value labels on bars
+    for bar in bars1:
+        height = bar.get_height()
+        ax.annotate(f'{height:.0f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha='center', va='bottom', fontsize=9)
+    for bar in bars2:
+        height = bar.get_height()
+        ax.annotate(f'{height:.0f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha='center', va='bottom', fontsize=9)
+
+    ax.set_ylabel('VRAM Usage (MB)', fontweight='bold')
+    ax.set_xlabel('Version', fontweight='bold')
+    ax.set_title('Peak VRAM Usage by Version', fontweight='bold', pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels([get_cache_label(v) for v in versions], rotation=15, ha='right')
+    ax.legend(frameon=True, fancybox=True, shadow=True)
+    ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+
+    # Set y-axis to start from a reasonable value
+    min_val = min(baseline_mb) * 0.95
+    ax.set_ylim(bottom=min_val)
+
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data.get('gpu_name', 'N/A')} | Pre-allocated cache causes higher baseline for v1+",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    path = Path(output_dir) / 'vram_bar_chart.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_per_phase_pie_v0_v1(results, output_dir):
+    """
+    Side-by-side pie charts showing per-phase breakdown for v0 and v1.
+    Clearly shows how KV-cache changes the time distribution.
+    """
+    # Collect per_phase_timing data
+    phase_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'per_phase_timing' and version in ('v0', 'v1'):
+            if data:
+                phase_data[version] = data[-1]  # Latest record
+
+    if 'v0' not in phase_data or 'v1' not in phase_data:
+        print("  Need both v0 and v1 per-phase data for pie charts. Skipping.")
+        return
+
+    # Define phases and colors
+    phase_order = ['embedding', 'attention', 'mlp', 'head', 'other']
+    phase_labels = {
+        'embedding': 'Embedding',
+        'attention': 'Attention',
+        'mlp': 'MLP',
+        'head': 'LM Head',
+        'other': 'Other'
+    }
+    phase_colors = {
+        'embedding': '#06A77D',
+        'attention': '#2E86AB',
+        'mlp': '#A23B72',
+        'head': '#F18F01',
+        'other': '#999999'
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    for idx, version in enumerate(['v0', 'v1']):
+        ax = axes[idx]
+        times = phase_data[version]['time_phase_ms']
+        total = times.get('total', sum(times.get(p, 0) for p in phase_order))
+
+        # Get values for each phase
+        values = []
+        labels = []
+        colors = []
+        for p in phase_order:
+            v = times.get(p, 0)
+            if v > 0:
+                values.append(v)
+                pct = (v / total) * 100 if total > 0 else 0
+                labels.append(f'{phase_labels[p]}\n{v:.0f}ms ({pct:.1f}%)')
+                colors.append(phase_colors[p])
+
+        wedges, texts = ax.pie(values, colors=colors, startangle=90,
+                                wedgeprops=dict(width=0.7, edgecolor='white'))
+
+        # Add legend
+        ax.legend(wedges, labels, loc='center left', bbox_to_anchor=(0.9, 0.5),
+                  fontsize=9, frameon=False)
+
+        cache_label = get_cache_label(version)
+        T_star = phase_data[version].get('T_star', '?')
+        ax.set_title(f'{cache_label}\nTotal: {total:.0f}ms (T={T_star})',
+                     fontweight='bold', fontsize=12)
+
+    # Add overall title
+    fig.suptitle('Per-Phase Time Breakdown: v0 vs v1', fontweight='bold', fontsize=14, y=1.02)
+
+    # Add system info
+    first_data = phase_data['v0']
+    fig.text(0.5, 0.02,
+             f"GPU: {first_data.get('gpu_name', 'N/A')} | KV-cache reduces MLP work by avoiding redundant computation",
+             ha='center', fontsize=9, style='italic', color='#555555')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 0.98])
+    path = Path(output_dir) / 'per_phase_pie_v0_v1.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate professional plots from nanoGPT benchmark results."
@@ -1904,6 +2263,20 @@ def main():
     print("\nGenerating comparison plots...")
     plot_latency_comparison(results, output_dir)
     plot_vram_comparison(results, output_dir)
+
+    # Split comparison plots: v0 vs v1 (fundamental), then KV variants
+    print("\nGenerating split comparison plots (v0 vs v1, KV variants)...")
+    plot_v0_vs_v1_latency(results, output_dir)
+    plot_kv_variants_latency(results, output_dir)
+    plot_speedup_vs_v1(results, output_dir)
+
+    # Pie chart breakdown for v0 vs v1
+    print("\nGenerating per-phase pie charts (v0 vs v1)...")
+    plot_per_phase_pie_v0_v1(results, output_dir)
+
+    # VRAM bar chart (better than delta plots for papers)
+    print("\nGenerating VRAM bar chart...")
+    plot_vram_bar_chart(results, output_dir)
 
     # New comparison plots
     print("\nGenerating additional comparison plots...")
