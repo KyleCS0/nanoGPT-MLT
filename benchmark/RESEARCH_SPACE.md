@@ -282,17 +282,33 @@ This reframes v4 from "failure" to **"Throughput Optimization"** (at cost of lat
 | `comparison_peak_memory_at_max_batch.png` | Peak memory at max batch |
 | `comparison_extrapolation.png` | Extrapolation |
 
+### Split Comparison Plots (8) - NEW
+| File | Description |
+|------|-------------|
+| `comparison_v0_vs_v1_latency.png` | v0 vs v1 per-token latency |
+| `comparison_kv_variants_latency.png` | KV variants (v1-v4) latency |
+| `comparison_speedup_vs_v1.png` | Speedup relative to v1 |
+| `v0_v1_total_latency_projection.png` | v0 vs v1 with T=4096 projection, R² |
+| `kv_variants_per_token_bar_T1024.png` | KV variants bar chart at T=1024 |
+| `kv_variants_throughput_bar_T1024.png` | KV variants throughput bar at T=1024 |
+| `kv_variants_vram_bar_T1024.png` | KV variants VRAM bar at T=1024 |
+| `vram_growth_v0_v1.png` | v0 vs v1 memory scaling |
+
 ### Per-Version Analysis (15)
 - `latency_per_token_vs_T_v{0-4}.png` (5 files)
 - `latency_total_vs_T_v{0-4}.png` (5 files)
 - `vram_vs_T_v{0-4}.png` (5 files)
 
-### Specialized Analysis (3)
+### Specialized Analysis (7)
 | File | Description |
 |------|-------------|
-| `pareto_memory_latency.png` | Pareto frontier |
+| `pareto_memory_latency.png` | Pareto frontier (T=512) |
+| `tradeoff_memory_latency_T1024.png` | Improved Pareto at T=1024 |
 | `per_phase_breakdown_bar.png` | Phase breakdown (bar) |
 | `per_phase_breakdown_stacked.png` | Phase breakdown (stacked) |
+| `per_phase_breakdown_with_insights.png` | Phase breakdown with key findings |
+| `per_phase_pie_v0_v1.png` | v0 vs v1 pie charts |
+| `per_phase_pie_improved.png` | Pie charts with % on slices |
 
 ### Roofline (2)
 | File | Description |
@@ -305,12 +321,14 @@ This reframes v4 from "failure" to **"Throughput Optimization"** (at cost of lat
 |------|-------------|
 | `assets/gpt2_124M_loss.png` | Training loss curve |
 | `assets/nanogpt.jpg` | NanoGPT logo |
+| `vram_bar_chart.png` | VRAM baseline vs peak bar chart |
 
 ### Data Files
 | File | Description |
 |------|-------------|
 | `plots/metrics_summary.json` | JSON metrics |
 | `plots/benchmark_tables.tex` | LaTeX tables |
+| `plots/perplexity_table.md` | Perplexity markdown table |
 
 ### NCU Reports (6)
 | File | Description |
@@ -329,13 +347,14 @@ This reframes v4 from "failure" to **"Throughput Optimization"** (at cost of lat
 | Category | Count |
 |----------|-------|
 | Comparison plots | 14 |
+| Split comparison plots | 8 |
 | Per-version plots | 15 |
-| Specialized plots | 3 |
+| Specialized plots | 7 |
 | Roofline plots | 2 |
-| Supporting assets | 2 |
-| Data files | 2 |
+| Supporting assets | 3 |
+| Data files | 3 |
 | NCU reports | 6 |
-| **Total** | **44** |
+| **Total** | **58** |
 
 ---
 
