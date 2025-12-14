@@ -1,0 +1,17 @@
+\begin{table}[h]
+\centering
+\caption{Roofline Analysis: Performance Characterization Against Hardware Limits}
+\label{tab:roofline_metrics}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Scenario} & \textbf{DRAM (GB)} & \textbf{FLOPs (M)} & \textbf{AI} & \textbf{Achieved (GF/s)} & \textbf{Theoretical (GF/s)} & \textbf{Status} \\
+\midrule
+v0 Prefill & 1.48 & 2320 & 1.57 & 377.0 & 1206 & Mem-bound \\
+v1 Prefill & 1.48 & 2320 & 1.56 & 375.0 & 1197 & Mem-bound \\
+v1 Decode & 0.88 & 448 & 0.51 & 146.3 & 392 & Mem-bound \\
+\bottomrule
+\end{tabular}
+\\\vspace{0.3cm}
+{\small \textit{AI:} Arithmetic Intensity (FLOPs/byte). \textit{Achieved:} Measured throughput. \textit{Theoretical:} Maximum at this AI (min of memory bandwidth and compute rooflines). All scenarios are memory-bound (below compute limit of 312 TFLOPS). Ridge point (AI crossing) is at 406 FLOPs/byte. The low achieved throughput relative to theoretical reveals memory subsystem inefficiency—a key optimization target.}
+}
+\end{table}

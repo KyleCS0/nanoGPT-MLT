@@ -1,0 +1,49 @@
+% ============================================================================
+% PAPER TABLES — Include in Main Document
+% ============================================================================
+% 
+% These three tables form the complete quantitative backbone of the paper.
+% No redundancy. All justified. Placed at optimal locations per outline.
+%
+% Usage in main paper:
+%   \section{Baseline Characterization: The Unoptimized State}
+%   \subsection{Experimental Setup}
+%   \input{tables/table_benchmark_configuration.tex}
+%
+%   \subsection{Roofline Analysis}
+%   \input{tables/table_roofline_metrics.tex}
+%
+%   \section{Evaluation: Performance, Quality, and Trade-offs}
+%   \subsection{Evaluation Protocol}
+%   \input{tables/results_summary_table.tex}
+%
+% ============================================================================
+
+\documentclass[11pt]{article}
+\usepackage{booktabs}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Paper Tables — LaTeX Source}
+\author{}
+\date{}
+
+\begin{document}
+
+\section{Table 1: Benchmark Configuration (§4.1)}
+
+\input{table_benchmark_configuration.tex}
+
+\pagebreak
+
+\section{Table 2: Roofline Metrics (§4.5)}
+
+\input{table_roofline_metrics.tex}
+
+\pagebreak
+
+\section{Table 3: Core Results Summary (§7.0)}
+
+\input{results_summary_table.tex}
+
+\end{document}

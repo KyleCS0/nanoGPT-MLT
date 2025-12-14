@@ -1,0 +1,55 @@
+\begin{table}[h]
+\centering
+\caption{Benchmark Configuration: Hardware, Software, Model, and Evaluation Setup}
+\label{tab:benchmark_configuration}
+\begin{tabular}{ll}
+\toprule
+\textbf{Category} & \textbf{Specification} \\
+\midrule
+\multicolumn{2}{l}{\textbf{Hardware}} \\
+GPU & NVIDIA RTX A6000 (48 GB VRAM) \\
+GPU Memory Bandwidth & 768 GB/s \\
+GPU Peak Throughput & 312 TFLOPS (bfloat16) \\
+Clock Locking & Enabled (P0 max clocks) \\
+\midrule
+\multicolumn{2}{l}{\textbf{Software Environment}} \\
+Python Version & 3.11.14 \\
+PyTorch Version & 2.9.1+cu128 \\
+CUDA Version & 12.8 \\
+Precision & bfloat16 (mixed precision) \\
+\midrule
+\multicolumn{2}{l}{\textbf{Model Configuration}} \\
+Model & GPT-2 Medium (Pretrained) \\
+Total Parameters & 378.96M \\
+Number of Layers & 24 \\
+Number of Attention Heads & 16 \\
+Embedding Dimension & 1024 \\
+Block Size (Context Length) & 1024 \\
+Vocabulary Size & 50,257 \\
+Dropout & 0.0 (evaluation) \\
+\midrule
+\multicolumn{2}{l}{\textbf{Benchmark Configuration}} \\
+Batch Size & 1 (single sample, autoregressive) \\
+Sequence Lengths (T) & 32, 64, 96, 128, 160, 192, 224, 256, 320, 384, \\
+ & 448, 512, 640, 768, 896, 1024 \\
+Warmup Iterations & 5 (per benchmark, per version) \\
+Measurement Repetitions & 10 (per T value, per version) \\
+\midrule
+\multicolumn{2}{l}{\textbf{Dataset and Evaluation}} \\
+Dataset & WikiText-2 (test split) \\
+Total Tokens Available & 287,644 \\
+Tokens per Evaluation & 4,096 (autoregressive, chunked) \\
+Evaluation Mode & Autoregressive (one token at a time) \\
+Chunking Strategy & Independent ≤1024-token chunks (resets KV cache) \\
+\midrule
+\multicolumn{2}{l}{\textbf{Measurement Details}} \\
+Timing Method & torch.cuda.Event (GPU wall-clock) \\
+Memory Measurement & torch.cuda.memory\_reserved() \\
+Metrics Synchronized & Yes (torch.cuda.synchronize()) \\
+Deduplication Strategy & Keep latest run per (benchmark, version, T) \\
+\bottomrule
+\end{tabular}
+\\\vspace{0.3cm}
+{\small \textit{This configuration ensures reproducibility and fair comparison across all optimization variants. Clock locking and warmup iterations eliminate timing variance. The chunked evaluation strategy avoids sliding window position embedding artifacts discovered during development.}
+}
+\end{table}

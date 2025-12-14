@@ -1,0 +1,18 @@
+\begin{table}[h]
+\centering
+\caption{Core Results Summary (Table B): KV-Cache Optimization Performance at T=1024}
+\label{tab:core_results}
+\begin{tabular}{l|cccccc}
+\toprule
+Version & Latency (ms) & Per-Token (ms) & VRAM (MB) & PPL & Max Batch & Speedup \\
+\midrule
+v0 & 7362.5 & 7.19 & 799.2 & 22.60 & 7586 & 1.00$\times$ \\
+\textbf{v1} & \textbf{3347.9} & \textbf{3.27} & \textbf{920.8} & \textbf{22.54} & 491 & \textbf{2.20$\times$} \\
+v2 & 6754.1 & 6.60 & 845.4 & 22.58 & 962 & 1.09$\times$ \\
+v3 & 3099.4 & 3.03 & 845.3 & \textbf{988.76} & 970 & 2.38$\times$ \\
+v4 & 5273.4 & 5.15 & 807.6 & 997.09 & \textbf{1867} & 1.40$\times$ \\
+\bottomrule
+\end{tabular}
+\\\vspace{0.2cm}
+{\footnotesize \textit{GPU:} NVIDIA RTX A6000 (48GB). \textit{Model:} GPT-2 Medium (378.96M params, 24 layers, block\_size=1024). \textit{Eval:} Autoregressive on WikiText-2 test split (287,644 tokens), 4096 token window. \textit{Speedup:} vs v0 baseline (no cache).}
+\end{table}
