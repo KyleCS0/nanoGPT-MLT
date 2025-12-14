@@ -19,17 +19,26 @@ Usage:
 
     # Quick test with limited tokens
     python benchmark/perplexity.py --autoregressive --max-tokens 10000 --version v1 v2
+
+    # With seed for reproducibility
+    python benchmark/perplexity.py --seed 42 --version v0 v1
 """
 
+from __future__ import annotations
+
 import argparse
+import hashlib
 import math
 import os
 import sys
 import json
 import platform
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Any
 from tqdm import tqdm
 
 import torch
+import torch.nn.functional as F
 import tiktoken
 
 # Add project root to path
@@ -37,19 +46,53 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from model import GPT, GPTConfig, KVCache
 from benchmark.versions import VERSIONS, get_version_config, load_model_for_version, get_model_config_dict
-import torch.nn.functional as F
 
 
-def load_wikitext2(max_tokens=None):
+# Cache directory for tokenized datasets
+CACHE_DIR = Path(__file__).parent / '.cache'
+
+
+def set_seed(seed: int) -> None:
+    """Set random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Note: We don't set numpy/random seeds since we don't use them
+
+
+def get_device() -> str:
+    """Get the best available device."""
+    if torch.cuda.is_available():
+        return 'cuda'
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
+def load_wikitext2(max_tokens: Optional[int] = None, use_cache: bool = True) -> torch.Tensor:
     """
     Load WikiText-2 test set and tokenize with tiktoken.
 
+    Caches tokenized data to disk for faster subsequent loads.
+
     Args:
         max_tokens: Limit to first N tokens (for quick testing)
+        use_cache: Whether to use/save cached tokenized data
 
     Returns:
         tokens: 1D tensor of token IDs
     """
+    cache_file = CACHE_DIR / 'wikitext2_gpt2_tokens.pt'
+
+    # Try to load from cache
+    if use_cache and cache_file.exists():
+        print(f"Loading tokenized WikiText-2 from cache...")
+        tokens = torch.load(cache_file, weights_only=True)
+        if max_tokens is not None:
+            tokens = tokens[:max_tokens]
+        print(f"Total tokens: {len(tokens):,}")
+        return tokens
+
+    # Load and tokenize
     try:
         from datasets import load_dataset
     except ImportError:
@@ -66,17 +109,29 @@ def load_wikitext2(max_tokens=None):
     # Tokenize with GPT-2 tokenizer
     print("Tokenizing with GPT-2 tokenizer...")
     enc = tiktoken.get_encoding("gpt2")
-    tokens = enc.encode(text, allowed_special={"<|endoftext|>"})
+    tokens_list = enc.encode(text, allowed_special={"<|endoftext|>"})
+    tokens = torch.tensor(tokens_list, dtype=torch.long)
+
+    # Save to cache
+    if use_cache:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        torch.save(tokens, cache_file)
+        print(f"Cached tokenized data to {cache_file}")
 
     if max_tokens is not None:
         tokens = tokens[:max_tokens]
 
     print(f"Total tokens: {len(tokens):,}")
-    return torch.tensor(tokens, dtype=torch.long)
+    return tokens
 
 
 @torch.no_grad()
-def compute_perplexity(model, tokens, stride=512, device='cuda'):
+def compute_perplexity(
+    model: GPT,
+    tokens: torch.Tensor,
+    stride: int = 512,
+    device: str = 'cuda'
+) -> Tuple[float, float, int]:
     """
     Compute perplexity using sliding window evaluation.
 
@@ -94,9 +149,7 @@ def compute_perplexity(model, tokens, stride=512, device='cuda'):
         device: Device to run on
 
     Returns:
-        perplexity: exp(avg_loss)
-        avg_loss: Average cross-entropy loss per token
-        total_tokens: Number of tokens evaluated (non-overlapping)
+        Tuple of (perplexity, avg_loss, total_tokens)
     """
     model.eval()
     block_size = model.config.block_size
@@ -106,9 +159,10 @@ def compute_perplexity(model, tokens, stride=512, device='cuda'):
     total_tokens = 0
     prev_end = 0
 
-    # Sliding window evaluation
-    num_windows = max(1, (seq_len - 1 + stride - 1) // stride)
-    pbar = tqdm(range(0, seq_len - 1, stride), desc="Evaluating", total=num_windows)
+    # Calculate actual number of windows for accurate progress bar
+    # Windows start at positions: 0, stride, 2*stride, ... up to seq_len-2
+    window_starts = list(range(0, seq_len - 1, stride))
+    pbar = tqdm(window_starts, desc="Evaluating")
 
     for begin in pbar:
         end = min(begin + block_size, seq_len)
@@ -157,8 +211,13 @@ def compute_perplexity(model, tokens, stride=512, device='cuda'):
 
 
 @torch.no_grad()
-def compute_perplexity_autoregressive(model, tokens, device='cuda', use_cache=True,
-                                       cross_layer_sharing=False):
+def compute_perplexity_autoregressive(
+    model: GPT,
+    tokens: torch.Tensor,
+    device: str = 'cuda',
+    use_cache: bool = True,
+    cross_layer_sharing: bool = False
+) -> Tuple[float, float, int]:
     """
     Compute perplexity using true autoregressive evaluation (one token at a time).
 
@@ -174,9 +233,7 @@ def compute_perplexity_autoregressive(model, tokens, device='cuda', use_cache=Tr
         cross_layer_sharing: Whether cross-layer sharing is enabled
 
     Returns:
-        perplexity: exp(avg_loss)
-        avg_loss: Average cross-entropy loss per token
-        total_tokens: Number of tokens evaluated
+        Tuple of (perplexity, avg_loss, total_tokens)
     """
     model.eval()
     block_size = model.config.block_size
@@ -241,7 +298,14 @@ def compute_perplexity_autoregressive(model, tokens, device='cuda', use_cache=Tr
     return perplexity, avg_loss, total_tokens
 
 
-def log_result(result, log_file, model_config, preset, dtype):
+def log_result(
+    result: Dict[str, Any],
+    log_file: str,
+    model_config: Dict[str, Any],
+    preset: str,
+    dtype: str,
+    device: str = 'cuda'
+) -> None:
     """
     Append result to JSONL log file.
 
@@ -251,35 +315,61 @@ def log_result(result, log_file, model_config, preset, dtype):
         model_config: Model configuration dict
         preset: Model preset name
         dtype: Data type string
+        device: Device used for evaluation
     """
+    # Get device info (handle non-CUDA devices)
+    if device == 'cuda' and torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_vram = torch.cuda.get_device_properties(0).total_memory
+        cuda_version = torch.version.cuda
+    else:
+        gpu_name = device
+        gpu_vram = 0
+        cuda_version = None
+
     record = {
         'implementation_name': 'baseline',
-        'gpu_name': torch.cuda.get_device_name(0),
-        'gpu_total_vram': torch.cuda.get_device_properties(0).total_memory,
+        'gpu_name': gpu_name,
+        'gpu_total_vram': gpu_vram,
         'python_version': platform.python_version(),
         'pytorch_version': torch.__version__,
-        'cuda_version': torch.version.cuda,
+        'cuda_version': cuda_version,
         'dtype': dtype,
         'model_config': model_config,
         'pretrained': preset,
         **result
     }
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    with open(log_file, 'a') as f:
-        f.write(json.dumps(record) + '\n')
+
+    # Create directory and write
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(log_path, 'a') as f:
+            f.write(json.dumps(record) + '\n')
+    except IOError as e:
+        print(f"Warning: Failed to write to log file: {e}")
 
 
-def print_results_table(results, versions):
+def print_results_table(
+    results: Dict[str, Dict[str, float]],
+    versions: list,
+    baseline_version: Optional[str] = None
+) -> None:
     """
     Print a formatted results table.
 
     Args:
-        results: Dict mapping version -> perplexity
+        results: Dict mapping version -> {'perplexity': float, ...}
         versions: List of version names
+        baseline_version: Version to use as baseline (default: first version)
     """
-    # Find baseline (first version)
-    baseline_version = versions[0]
-    baseline_ppl = results[baseline_version]['perplexity']
+    if not versions:
+        print("No versions to display.")
+        return
+
+    # Find baseline
+    baseline_v = baseline_version if baseline_version is not None else versions[0]
+    baseline_ppl = results[baseline_v]['perplexity']
 
     print("\n" + "=" * 70)
     print("Results:")
@@ -292,7 +382,7 @@ def print_results_table(results, versions):
         v_config = get_version_config(version)
         desc = v_config['description']
 
-        if version == baseline_version:
+        if version == baseline_v:
             deg_str = "baseline"
         else:
             degradation = ((ppl - baseline_ppl) / baseline_ppl) * 100
@@ -323,7 +413,7 @@ Example:
     parser.add_argument(
         '--preset', type=str,
         choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'],
-        default='gpt2',
+        default='gpt2-medium',
         help='Pretrained GPT-2 model to use'
     )
     parser.add_argument(
@@ -358,8 +448,21 @@ Example:
         help='Use autoregressive evaluation (one token at a time with KV-cache). '
              'Slower but actually tests cache optimizations.'
     )
+    parser.add_argument(
+        '--seed', type=int, default=None,
+        help='Random seed for reproducibility'
+    )
+    parser.add_argument(
+        '--no-cache', action='store_true',
+        help='Disable tokenized data caching (always reload from source)'
+    )
 
     args = parser.parse_args()
+
+    # Set seed for reproducibility
+    if args.seed is not None:
+        set_seed(args.seed)
+        print(f"Set random seed: {args.seed}")
 
     # Validate versions
     for v in args.version:
@@ -367,13 +470,18 @@ Example:
             print(f"Error: Unknown version '{v}'. Available: {available_versions}")
             sys.exit(1)
 
+    # Detect device
+    device = get_device()
+    if device != 'cuda':
+        print(f"Warning: CUDA not available, using {device}. Performance may be limited.")
+
     # Clear log if requested
     if args.clear_log and os.path.exists(args.log_file):
         os.remove(args.log_file)
         print(f"Cleared log: {args.log_file}")
 
     # Load dataset
-    tokens = load_wikitext2(max_tokens=args.max_tokens)
+    tokens = load_wikitext2(max_tokens=args.max_tokens, use_cache=not args.no_cache)
 
     eval_mode = "autoregressive" if args.autoregressive else "teacher-forcing"
 
@@ -381,6 +489,7 @@ Example:
     print("Perplexity Evaluation")
     print("=" * 70)
     print(f"  Model: {args.preset}")
+    print(f"  Device: {device}")
     print(f"  Dataset: WikiText-2 (test split)")
     print(f"  Mode: {eval_mode}")
     if not args.autoregressive:
@@ -407,6 +516,7 @@ Example:
             # This actually tests the cache optimizations
             ppl, loss, n_tokens = compute_perplexity_autoregressive(
                 model, tokens,
+                device=device,
                 use_cache=use_cache,
                 cross_layer_sharing=v_config['cross_layer_sharing']
             )
@@ -414,7 +524,7 @@ Example:
             # Teacher-forcing: full sequence forward pass (cache not used)
             # All versions produce identical perplexity
             ppl, loss, n_tokens = compute_perplexity(
-                model, tokens, stride=args.stride
+                model, tokens, stride=args.stride, device=device
             )
 
         results[version] = {
@@ -441,11 +551,12 @@ Example:
             'perplexity': ppl,
             'loss': loss,
         }
-        log_result(result, args.log_file, model_config, args.preset, args.dtype)
+        log_result(result, args.log_file, model_config, args.preset, args.dtype, device=device)
 
         # Clean up model
         del model
-        torch.cuda.empty_cache()
+        if device == 'cuda':
+            torch.cuda.empty_cache()
 
     # Print summary table
     print_results_table(results, args.version)

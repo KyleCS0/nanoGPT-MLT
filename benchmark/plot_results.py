@@ -2114,6 +2114,667 @@ def plot_speedup_vs_v1(results, output_dir):
     plt.close()
 
 
+# =============================================================================
+# NEW SPLIT COMPARISON PLOTS - Avoid v0 distortion
+# =============================================================================
+
+def add_standard_footer(fig, gpu="A6000", dtype="fp16", extra=""):
+    """Add standardized footer to plots - consistent metadata display."""
+    footer = f"GPU: {gpu} | {dtype}"
+    if extra:
+        footer += f" | {extra}"
+    fig.text(0.5, 0.01, footer, ha='center', fontsize=8, style='italic', color='#666666')
+
+
+def plot_v0_v1_total_latency_with_projection(results, output_dir, T_max=4096):
+    """
+    v0 vs v1 total latency with projection to T_max.
+    Shows quadratic (v0) vs linear (v1) scaling with R² values.
+    """
+    latency_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T' and version in ('v0', 'v1'):
+            latency_data[version] = sorted(data, key=lambda x: x['T'])
+
+    if 'v0' not in latency_data or 'v1' not in latency_data:
+        print("  Need both v0 and v1 for projection plot. Skipping.")
+        return
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+
+    # Extract data
+    v0_T = np.array([d['T'] for d in latency_data['v0']])
+    v0_time = np.array([d['time_total_ms_median'] for d in latency_data['v0']])
+    v0_std = np.array([d['time_total_ms_std'] for d in latency_data['v0']])
+
+    v1_T = np.array([d['T'] for d in latency_data['v1']])
+    v1_time = np.array([d['time_total_ms_median'] for d in latency_data['v1']])
+    v1_std = np.array([d['time_total_ms_std'] for d in latency_data['v1']])
+
+    max_measured_T = max(v0_T.max(), v1_T.max())
+
+    # Fit models
+    a0, b0, c0 = quadratic_fit(v0_T, v0_time)
+    v0_fit_vals = a0 * v0_T**2 + b0 * v0_T + c0
+    r2_v0 = r2_score(v0_time, v0_fit_vals)
+
+    # For v1, fit linear model (should be nearly linear with cache)
+    m1, b1 = linear_fit(v1_T, v1_time)
+    v1_fit_vals = m1 * v1_T + b1
+    r2_v1 = r2_score(v1_time, v1_fit_vals)
+
+    # Generate projection range
+    T_measured = np.linspace(min(v0_T.min(), v1_T.min()), max_measured_T, 200)
+    T_projected = np.linspace(max_measured_T, T_max, 200)
+
+    v0_measured_fit = a0 * T_measured**2 + b0 * T_measured + c0
+    v0_projected_fit = a0 * T_projected**2 + b0 * T_projected + c0
+
+    v1_measured_fit = m1 * T_measured + b1
+    v1_projected_fit = m1 * T_projected + b1
+
+    # Plot measured data points with error bars
+    ax.errorbar(v0_T, v0_time, yerr=v0_std, fmt='o', markersize=6,
+                color=VERSION_COLORS['v0'], ecolor=VERSION_COLORS['v0'],
+                capsize=3, alpha=0.8, label='v0 measured', zorder=5)
+    ax.errorbar(v1_T, v1_time, yerr=v1_std, fmt='s', markersize=6,
+                color=VERSION_COLORS['v1'], ecolor=VERSION_COLORS['v1'],
+                capsize=3, alpha=0.8, label='v1 measured', zorder=5)
+
+    # Plot fit lines (solid for measured, dashed for projected)
+    ax.plot(T_measured, v0_measured_fit, '-', color=VERSION_COLORS['v0'],
+            linewidth=2.5, alpha=0.9)
+    ax.plot(T_projected, v0_projected_fit, '--', color=VERSION_COLORS['v0'],
+            linewidth=2.5, alpha=0.7, label='v0 projected')
+
+    ax.plot(T_measured, v1_measured_fit, '-', color=VERSION_COLORS['v1'],
+            linewidth=2.5, alpha=0.9)
+    ax.plot(T_projected, v1_projected_fit, '--', color=VERSION_COLORS['v1'],
+            linewidth=2.5, alpha=0.7, label='v1 projected')
+
+    # Shade projection zone
+    ax.axvspan(max_measured_T, T_max, alpha=0.08, color='gray', label='Projection zone')
+    ax.axvline(x=max_measured_T, color='gray', linestyle=':', linewidth=1.5, alpha=0.7)
+
+    # Calculate projected values at T_max
+    v0_at_Tmax = a0 * T_max**2 + b0 * T_max + c0
+    v1_at_Tmax = m1 * T_max + b1
+    speedup_at_Tmax = v0_at_Tmax / v1_at_Tmax
+
+    # Add R² and equation annotation box
+    textstr = (f"v0: {a0:.5f}·T² + {b0:.2f}·T + {c0:.1f}\n"
+               f"     R² = {r2_v0:.6f} (quadratic)\n\n"
+               f"v1: {m1:.2f}·T + {b1:.1f}\n"
+               f"     R² = {r2_v1:.4f} (linear)")
+    ax.text(0.03, 0.97, textstr, transform=ax.transAxes, fontsize=9,
+            verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='wheat', alpha=0.9))
+
+    # Add projection insight
+    insight = (f"At T={T_max}:\n"
+               f"v0: {v0_at_Tmax/1000:.1f}s\n"
+               f"v1: {v1_at_Tmax/1000:.1f}s\n"
+               f"Speedup: {speedup_at_Tmax:.1f}x")
+    ax.text(0.97, 0.65, insight, transform=ax.transAxes, fontsize=11,
+            verticalalignment='top', ha='right', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='lightgreen', alpha=0.9))
+
+    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold', fontsize=12)
+    ax.set_ylabel('Total Generation Time (ms)', fontweight='bold', fontsize=12)
+    ax.set_title(f'Total Latency: v0 vs v1 with Projection to T={T_max}',
+                 fontweight='bold', fontsize=13, pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='upper left', fontsize=9)
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.set_xlim(left=0, right=T_max * 1.02)
+    ax.set_ylim(bottom=0)
+
+    # Extract GPU name (short form)
+    gpu_name = latency_data['v0'][0].get('gpu_name', 'GPU')
+    gpu_short = gpu_name.split()[-1] if 'RTX' in gpu_name or 'A' in gpu_name else gpu_name
+    dtype = latency_data['v0'][0].get('dtype', 'fp16')
+    add_standard_footer(fig, gpu=gpu_short, dtype=dtype, extra=f"Projection beyond T={max_measured_T}")
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    path = Path(output_dir) / 'v0_v1_total_latency_projection.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_kv_variants_per_token_bar(results, output_dir, T_target=1024):
+    """
+    Bar chart comparing v1-v4 per-token latency at fixed T.
+    Better than line chart since values are nearly constant.
+    """
+    latency_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T' and version in ('v1', 'v2', 'v3', 'v4'):
+            by_T = {d['T']: d for d in data}
+            if T_target in by_T:
+                latency_data[version] = by_T[T_target]
+
+    if len(latency_data) < 2:
+        print(f"  Need at least 2 KV variants with data at T={T_target}. Skipping.")
+        return
+
+    versions = sorted(latency_data.keys())
+    latencies = [latency_data[v]['time_per_token_ms_median'] for v in versions]
+    stds = [latency_data[v].get('time_per_token_ms_std', 0) for v in versions]
+    colors = [VERSION_COLORS.get(v, '#666666') for v in versions]
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    x = np.arange(len(versions))
+    bars = ax.bar(x, latencies, yerr=stds, capsize=6,
+                  color=colors, edgecolor='white', linewidth=1.5)
+
+    # Add value labels on bars
+    for bar, val, std in zip(bars, latencies, stds):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 0.1,
+                f'{val:.2f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+    # Reference line for v1 baseline
+    v1_latency = latency_data.get('v1', {}).get('time_per_token_ms_median', latencies[0])
+    ax.axhline(y=v1_latency, color=VERSION_COLORS['v1'], linestyle='--',
+               linewidth=2, alpha=0.7, label=f'v1 baseline ({v1_latency:.2f} ms)')
+
+    ax.set_ylabel('Per-Token Latency (ms)', fontweight='bold', fontsize=12)
+    ax.set_xlabel('Version', fontweight='bold', fontsize=12)
+    ax.set_title(f'KV-Cache Variants: Per-Token Latency at T={T_target}',
+                 fontweight='bold', fontsize=13, pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels([VERSION_LABELS.get(v, v) for v in versions], fontsize=10)
+    ax.legend(frameon=True, loc='upper right')
+    ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    # Add insight annotation
+    best_v = versions[np.argmin(latencies)]
+    worst_v = versions[np.argmax(latencies)]
+    ax.annotate(f'Best: {best_v} ({min(latencies):.2f} ms)\nWorst: {worst_v} ({max(latencies):.2f} ms)',
+                xy=(0.98, 0.98), xycoords='axes fraction',
+                fontsize=10, ha='right', va='top',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.9))
+
+    gpu_name = list(latency_data.values())[0].get('gpu_name', 'GPU')
+    gpu_short = gpu_name.split()[-1] if 'RTX' in gpu_name or 'A' in gpu_name else gpu_name
+    add_standard_footer(fig, gpu=gpu_short, dtype='fp16', extra=f'T={T_target}, Batch=1')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    path = Path(output_dir) / f'kv_variants_per_token_bar_T{T_target}.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_kv_variants_throughput_bar(results, output_dir, T_target=1024):
+    """
+    Bar chart comparing v1-v4 throughput (tokens/sec) at fixed T.
+    """
+    latency_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T' and version in ('v1', 'v2', 'v3', 'v4'):
+            by_T = {d['T']: d for d in data}
+            if T_target in by_T:
+                latency_data[version] = by_T[T_target]
+
+    if len(latency_data) < 2:
+        print(f"  Need at least 2 KV variants with data at T={T_target}. Skipping.")
+        return
+
+    versions = sorted(latency_data.keys())
+    throughputs = [1000.0 / latency_data[v]['time_per_token_ms_median'] for v in versions]
+    # Error propagation: delta_tput = tput * (delta_t / t)
+    stds = []
+    for v in versions:
+        t = latency_data[v]['time_per_token_ms_median']
+        t_std = latency_data[v].get('time_per_token_ms_std', 0)
+        tput = 1000.0 / t
+        stds.append(tput * (t_std / t) if t > 0 else 0)
+
+    colors = [VERSION_COLORS.get(v, '#666666') for v in versions]
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    x = np.arange(len(versions))
+    bars = ax.bar(x, throughputs, yerr=stds, capsize=6,
+                  color=colors, edgecolor='white', linewidth=1.5)
+
+    # Add value labels on bars
+    for bar, val, std in zip(bars, throughputs, stds):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 5,
+                f'{val:.0f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+    ax.set_ylabel('Throughput (tokens/sec)', fontweight='bold', fontsize=12)
+    ax.set_xlabel('Version', fontweight='bold', fontsize=12)
+    ax.set_title(f'KV-Cache Variants: Throughput at T={T_target}',
+                 fontweight='bold', fontsize=13, pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels([VERSION_LABELS.get(v, v) for v in versions], fontsize=10)
+    ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    gpu_name = list(latency_data.values())[0].get('gpu_name', 'GPU')
+    gpu_short = gpu_name.split()[-1] if 'RTX' in gpu_name or 'A' in gpu_name else gpu_name
+    add_standard_footer(fig, gpu=gpu_short, dtype='fp16', extra=f'T={T_target}, Batch=1')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    path = Path(output_dir) / f'kv_variants_throughput_bar_T{T_target}.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_kv_variants_vram_bar(results, output_dir, T_target=1024):
+    """
+    Bar chart comparing v1-v4 VRAM usage at fixed T.
+    """
+    vram_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'vram_vs_T' and version in ('v1', 'v2', 'v3', 'v4'):
+            by_T = {d['T']: d for d in data}
+            if T_target in by_T:
+                vram_data[version] = by_T[T_target]
+
+    if len(vram_data) < 2:
+        print(f"  Need at least 2 KV variants with VRAM data at T={T_target}. Skipping.")
+        return
+
+    versions = sorted(vram_data.keys())
+    vram_mb = [vram_data[v]['peak_memory_bytes'] / 1e6 for v in versions]
+    colors = [VERSION_COLORS.get(v, '#666666') for v in versions]
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    x = np.arange(len(versions))
+    bars = ax.bar(x, vram_mb, color=colors, edgecolor='white', linewidth=1.5)
+
+    # Add value labels on bars
+    for bar, val in zip(bars, vram_mb):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5,
+                f'{val:.0f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+    # Reference line for v1 baseline
+    v1_vram = vram_data.get('v1', {}).get('peak_memory_bytes', 0) / 1e6
+    if v1_vram > 0:
+        ax.axhline(y=v1_vram, color=VERSION_COLORS['v1'], linestyle='--',
+                   linewidth=2, alpha=0.7, label=f'v1 baseline ({v1_vram:.0f} MB)')
+
+    ax.set_ylabel('Peak VRAM (MB)', fontweight='bold', fontsize=12)
+    ax.set_xlabel('Version', fontweight='bold', fontsize=12)
+    ax.set_title(f'KV-Cache Variants: VRAM Usage at T={T_target}',
+                 fontweight='bold', fontsize=13, pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels([VERSION_LABELS.get(v, v) for v in versions], fontsize=10)
+    ax.legend(frameon=True, loc='upper right')
+    ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+
+    # Set y-axis to start from reasonable value
+    min_vram = min(vram_mb) * 0.95
+    ax.set_ylim(bottom=min_vram)
+
+    # Add memory savings annotation
+    if 'v1' in vram_data and 'v4' in vram_data:
+        v4_vram = vram_data['v4']['peak_memory_bytes'] / 1e6
+        savings = (1 - v4_vram / v1_vram) * 100 if v1_vram > 0 else 0
+        ax.annotate(f'v4 saves {savings:.0f}% vs v1',
+                    xy=(0.98, 0.98), xycoords='axes fraction',
+                    fontsize=10, ha='right', va='top',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgreen', alpha=0.9))
+
+    gpu_name = list(vram_data.values())[0].get('gpu_name', 'GPU')
+    gpu_short = gpu_name.split()[-1] if 'RTX' in gpu_name or 'A' in gpu_name else gpu_name
+    add_standard_footer(fig, gpu=gpu_short, dtype='fp16', extra=f'T={T_target}')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    path = Path(output_dir) / f'kv_variants_vram_bar_T{T_target}.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_memory_latency_tradeoff_improved(results, output_dir, T_target=1024):
+    """
+    Improved tradeoff plot at T=1024 where v0's penalty is clear.
+    v0 shown with hollow marker to distinguish from KV variants.
+    """
+    latency_data = {}
+    vram_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'latency_vs_T':
+            latency_data[version] = {d['T']: d for d in data}
+        elif benchmark_name == 'vram_vs_T':
+            vram_data[version] = {d['T']: d for d in data}
+
+    versions_with_data = []
+    for v in set(latency_data.keys()) & set(vram_data.keys()):
+        if T_target in latency_data[v] and T_target in vram_data[v]:
+            versions_with_data.append(v)
+
+    if len(versions_with_data) < 2:
+        print(f"  Need at least 2 versions at T={T_target} for tradeoff plot. Skipping.")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    # Separate v0 from KV variants
+    kv_versions = [v for v in versions_with_data if v != 'v0']
+
+    # Plot KV variants (filled markers)
+    for version in sorted(kv_versions):
+        vram_mb = vram_data[version][T_target]['peak_memory_bytes'] / 1e6
+        latency_ms = latency_data[version][T_target]['time_total_ms_median']
+
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+
+        ax.scatter(vram_mb, latency_ms, s=200, c=color, marker=marker,
+                   edgecolors='white', linewidth=2, zorder=5,
+                   label=VERSION_LABELS.get(version, version))
+
+        ax.annotate(version, (vram_mb, latency_ms),
+                    xytext=(10, 5), textcoords='offset points',
+                    fontsize=10, fontweight='bold', color=color)
+
+    # Plot v0 with hollow marker (different visual treatment)
+    if 'v0' in versions_with_data:
+        v0_vram = vram_data['v0'][T_target]['peak_memory_bytes'] / 1e6
+        v0_latency = latency_data['v0'][T_target]['time_total_ms_median']
+
+        ax.scatter(v0_vram, v0_latency, s=250, facecolors='none',
+                   edgecolors=VERSION_COLORS['v0'], linewidths=3, marker='o',
+                   zorder=5, label=f"v0: No cache (O(T²))")
+
+        ax.annotate('v0', (v0_vram, v0_latency),
+                    xytext=(10, 5), textcoords='offset points',
+                    fontsize=10, fontweight='bold', color=VERSION_COLORS['v0'])
+
+        # Add arrow showing v0's latency penalty
+        if 'v1' in versions_with_data:
+            v1_vram = vram_data['v1'][T_target]['peak_memory_bytes'] / 1e6
+            v1_latency = latency_data['v1'][T_target]['time_total_ms_median']
+            penalty = v0_latency / v1_latency
+
+            # Draw arrow from v1 to v0
+            ax.annotate('', xy=(v0_vram, v0_latency),
+                        xytext=(v1_vram, v1_latency),
+                        arrowprops=dict(arrowstyle='->', color='red',
+                                       lw=2, connectionstyle='arc3,rad=0.2'))
+            # Add penalty label
+            mid_x = (v0_vram + v1_vram) / 2
+            mid_y = (v0_latency + v1_latency) / 2
+            ax.annotate(f'{penalty:.1f}x slower\n(no cache penalty)',
+                        xy=(mid_x, mid_y), fontsize=10, color='red',
+                        fontweight='bold', ha='center')
+
+    # Shade "good" region (lower-left)
+    ax.annotate('← Better (lower latency, lower VRAM)',
+                xy=(0.02, 0.02), xycoords='axes fraction',
+                fontsize=9, ha='left', va='bottom', style='italic', color='#555555')
+
+    ax.set_xlabel('Peak VRAM Usage (MB)', fontweight='bold', fontsize=12)
+    ax.set_ylabel(f'Total Latency at T={T_target} (ms)', fontweight='bold', fontsize=12)
+    ax.set_title(f'Memory-Latency Tradeoff at T={T_target}', fontweight='bold', fontsize=13, pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='upper right', fontsize=9)
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    gpu_name = list(latency_data.values())[0][T_target].get('gpu_name', 'GPU')
+    gpu_short = gpu_name.split()[-1] if 'RTX' in gpu_name or 'A' in gpu_name else gpu_name
+    add_standard_footer(fig, gpu=gpu_short, dtype='fp16', extra=f'T={T_target}')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    path = Path(output_dir) / f'tradeoff_memory_latency_T{T_target}.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_vram_growth_comparison(results, output_dir):
+    """
+    Compare VRAM growth between v0 and v1.
+    Shows how memory scales differently with sequence length.
+    """
+    vram_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'vram_vs_T' and version in ('v0', 'v1'):
+            vram_data[version] = sorted(data, key=lambda x: x['T'])
+
+    if 'v0' not in vram_data or 'v1' not in vram_data:
+        print("  Need both v0 and v1 for VRAM growth comparison. Skipping.")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for version in ['v0', 'v1']:
+        data = vram_data[version]
+        T_values = [d['T'] for d in data]
+        peak_mb = [d['peak_memory_bytes'] / 1e6 for d in data]
+        baseline = peak_mb[0]
+        delta_mb = [m - baseline for m in peak_mb]
+
+        color = VERSION_COLORS.get(version, '#666666')
+        marker = VERSION_MARKERS.get(version, 'o')
+        label = VERSION_LABELS.get(version, version)
+
+        ax.plot(T_values, delta_mb, f'{marker}-', color=color, markersize=6,
+                linewidth=2.5, label=label)
+
+        # Add linear fit
+        m, b = linear_fit(T_values, delta_mb)
+        T_dense = np.linspace(min(T_values), max(T_values), 100)
+        ax.plot(T_dense, m * T_dense + b, '--', color=color, alpha=0.5, linewidth=1.5)
+
+    # Add insight box
+    v0_data = vram_data['v0']
+    v1_data = vram_data['v1']
+    v0_delta = v0_data[-1]['peak_memory_bytes'] / 1e6 - v0_data[0]['peak_memory_bytes'] / 1e6
+    v1_delta = v1_data[-1]['peak_memory_bytes'] / 1e6 - v1_data[0]['peak_memory_bytes'] / 1e6
+    max_T = v0_data[-1]['T']
+
+    insight = (f"Memory Growth (T=32 → T={max_T}):\n"
+               f"v0: +{v0_delta:.1f} MB\n"
+               f"v1: +{v1_delta:.1f} MB\n\n"
+               f"v1 uses {v1_delta/v0_delta:.1f}x more growth\n"
+               f"(KV-cache storage overhead)")
+    ax.text(0.03, 0.97, insight, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow', alpha=0.9))
+
+    ax.set_xlabel('Number of Generated Tokens (T)', fontweight='bold', fontsize=12)
+    ax.set_ylabel('VRAM Growth from Baseline (MB)', fontweight='bold', fontsize=12)
+    ax.set_title('VRAM Growth: v0 vs v1', fontweight='bold', fontsize=13, pad=15)
+    ax.legend(frameon=True, fancybox=True, shadow=True, loc='lower right')
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    gpu_name = vram_data['v0'][0].get('gpu_name', 'GPU')
+    gpu_short = gpu_name.split()[-1] if 'RTX' in gpu_name or 'A' in gpu_name else gpu_name
+    add_standard_footer(fig, gpu=gpu_short, dtype='fp16', extra=f'Baseline: T=32')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    path = Path(output_dir) / 'vram_growth_v0_v1.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_per_phase_pie_with_percentages(results, output_dir):
+    """
+    Improved pie charts with percentages directly ON the pie slices.
+    """
+    phase_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'per_phase_timing' and version in ('v0', 'v1'):
+            if data:
+                phase_data[version] = data[-1]
+
+    if 'v0' not in phase_data or 'v1' not in phase_data:
+        print("  Need both v0 and v1 per-phase data for improved pie charts. Skipping.")
+        return
+
+    phase_order = ['embedding', 'attention', 'mlp', 'head', 'other']
+    phase_labels = {
+        'embedding': 'Embed', 'attention': 'Attn',
+        'mlp': 'MLP', 'head': 'Head', 'other': 'Other'
+    }
+    phase_colors = {
+        'embedding': '#06A77D', 'attention': '#2E86AB',
+        'mlp': '#A23B72', 'head': '#F18F01', 'other': '#999999'
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    for idx, version in enumerate(['v0', 'v1']):
+        ax = axes[idx]
+        times = phase_data[version]['time_phase_ms']
+        total = times.get('total', sum(times.get(p, 0) for p in phase_order))
+
+        values = []
+        labels = []
+        colors = []
+        for p in phase_order:
+            v = times.get(p, 0)
+            if v > 0:
+                values.append(v)
+                labels.append(phase_labels[p])
+                colors.append(phase_colors[p])
+
+        # Use autopct to show percentages ON the pie
+        wedges, texts, autotexts = ax.pie(
+            values, labels=labels, colors=colors,
+            autopct='%1.1f%%', startangle=90,
+            wedgeprops=dict(width=0.7, edgecolor='white', linewidth=2),
+            textprops={'fontsize': 10},
+            pctdistance=0.75
+        )
+
+        # Style the percentage text
+        for autotext in autotexts:
+            autotext.set_fontsize(9)
+            autotext.set_fontweight('bold')
+            autotext.set_color('white')
+
+        cache_label = get_cache_label(version)
+        T_star = phase_data[version].get('T_star', '?')
+        ax.set_title(f'{cache_label}\nTotal: {total:.0f}ms (T={T_star})',
+                     fontweight='bold', fontsize=12)
+
+    fig.suptitle('Per-Phase Time Breakdown: v0 vs v1', fontweight='bold', fontsize=14, y=1.02)
+
+    # Add key insight
+    v0_attn = phase_data['v0']['time_phase_ms'].get('attention', 0)
+    v1_attn = phase_data['v1']['time_phase_ms'].get('attention', 0)
+    v0_total = phase_data['v0']['time_phase_ms'].get('total', 1)
+    v1_total = phase_data['v1']['time_phase_ms'].get('total', 1)
+
+    insight = (f"Key Finding: Attention is {v0_attn/v0_total*100:.0f}% (v0) vs {v1_attn/v1_total*100:.0f}% (v1)\n"
+               f"Total time reduced by {(1-v1_total/v0_total)*100:.0f}%")
+    fig.text(0.5, 0.02, insight, ha='center', fontsize=10, style='italic',
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.9))
+
+    plt.tight_layout(rect=[0, 0.06, 1, 0.98])
+    path = Path(output_dir) / 'per_phase_pie_improved.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+def plot_per_phase_breakdown_with_insights(results, output_dir):
+    """
+    Improved per-phase breakdown bar chart with key insights highlighted.
+    """
+    phase_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'per_phase_timing':
+            for record in data:
+                v = record.get('version', 'unknown')
+                phase_data[v] = record
+
+    if len(phase_data) < 2:
+        print("  Need at least 2 versions for per-phase breakdown. Skipping.")
+        return
+
+    versions = sorted(phase_data.keys())
+    T_star = phase_data[versions[0]]['T_star']
+
+    phase_order = ['embedding', 'attention', 'mlp', 'head', 'other']
+    phase_labels = {
+        'embedding': 'Embedding', 'attention': 'Self-Attention',
+        'mlp': 'MLP', 'head': 'LM Head', 'other': 'Other'
+    }
+
+    all_phases = set()
+    for v in versions:
+        all_phases.update(phase_data[v]['time_phase_ms'].keys())
+    phases = [p for p in phase_order if p in all_phases and p != 'total']
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    x = np.arange(len(phases))
+    width = 0.8 / len(versions)
+
+    for i, version in enumerate(versions):
+        phase_times = phase_data[version]['time_phase_ms']
+        times = [phase_times.get(p, 0) for p in phases]
+        offset = (i - len(versions)/2 + 0.5) * width
+        color = VERSION_COLORS.get(version, plt.cm.tab10(i / len(versions)))
+
+        bars = ax.bar(x + offset, times, width, label=VERSION_LABELS.get(version, version),
+                     color=color, edgecolor='white', linewidth=0.5)
+
+        for bar, t in zip(bars, times):
+            if t > 0:
+                ax.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                       f'{t:.0f}', ha='center', va='bottom', fontsize=8, rotation=0)
+
+    ax.set_ylabel('Time (ms)', fontweight='bold', fontsize=12)
+    ax.set_xlabel('Phase', fontweight='bold', fontsize=12)
+    ax.set_title(f'Per-Phase Timing Breakdown by Version (T={T_star})', fontweight='bold', fontsize=13, pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels([phase_labels[p] for p in phases], fontsize=10)
+    ax.legend(loc='upper right', fontsize=9)
+    ax.grid(True, axis='y', linestyle='--', alpha=0.3)
+
+    # Add key insights box
+    if 'v0' in phase_data and 'v1' in phase_data:
+        v0_times = phase_data['v0']['time_phase_ms']
+        v1_times = phase_data['v1']['time_phase_ms']
+        v0_total = v0_times.get('total', sum(v0_times.get(p, 0) for p in phases))
+        v1_total = v1_times.get('total', sum(v1_times.get(p, 0) for p in phases))
+
+        # Find biggest change
+        changes = {}
+        for p in phases:
+            v0_p = v0_times.get(p, 0)
+            v1_p = v1_times.get(p, 0)
+            if v0_p > 0:
+                changes[p] = ((v1_p - v0_p) / v0_p) * 100
+
+        biggest_change = min(changes.items(), key=lambda x: x[1]) if changes else ('N/A', 0)
+
+        insights = (f"Key Findings (T={T_star}):\n"
+                   f"• Total: {v0_total:.0f}ms → {v1_total:.0f}ms ({(1-v1_total/v0_total)*100:+.0f}%)\n"
+                   f"• Biggest reduction: {phase_labels.get(biggest_change[0], biggest_change[0])} ({biggest_change[1]:.0f}%)\n"
+                   f"• KV-cache avoids redundant attention computation")
+        ax.text(0.02, 0.98, insights, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow', alpha=0.9))
+
+    gpu_name = phase_data[versions[0]].get('gpu_name', 'GPU')
+    gpu_short = gpu_name.split()[-1] if 'RTX' in gpu_name or 'A' in gpu_name else gpu_name
+    add_standard_footer(fig, gpu=gpu_short, dtype='fp16', extra=f'T={T_star}')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    path = Path(output_dir) / 'per_phase_breakdown_with_insights.png'
+    plt.savefig(path, bbox_inches='tight', facecolor='white', edgecolor='none')
+    print(f"  Saved: {path}")
+    plt.close()
+
+
+# =============================================================================
+# ORIGINAL FUNCTIONS CONTINUE BELOW
+# =============================================================================
+
 def plot_vram_bar_chart(results, output_dir):
     """
     Bar chart showing peak VRAM usage for each version.
@@ -2347,9 +3008,23 @@ def main():
     plot_kv_variants_latency(results, output_dir)
     plot_speedup_vs_v1(results, output_dir)
 
+    # NEW: Enhanced split plots with projection and bar charts
+    print("\nGenerating enhanced split plots (projection, bar charts)...")
+    plot_v0_v1_total_latency_with_projection(results, output_dir, T_max=4096)
+    plot_kv_variants_per_token_bar(results, output_dir, T_target=1024)
+    plot_kv_variants_throughput_bar(results, output_dir, T_target=1024)
+    plot_kv_variants_vram_bar(results, output_dir, T_target=1024)
+    plot_vram_growth_comparison(results, output_dir)
+
+    # NEW: Improved tradeoff plot at T=1024
+    print("\nGenerating improved tradeoff plot (T=1024)...")
+    plot_memory_latency_tradeoff_improved(results, output_dir, T_target=1024)
+
     # Pie chart breakdown for v0 vs v1
     print("\nGenerating per-phase pie charts (v0 vs v1)...")
     plot_per_phase_pie_v0_v1(results, output_dir)
+    plot_per_phase_pie_with_percentages(results, output_dir)
+    plot_per_phase_breakdown_with_insights(results, output_dir)
 
     # VRAM bar chart (better than delta plots for papers)
     print("\nGenerating VRAM bar chart...")
