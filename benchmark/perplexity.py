@@ -221,9 +221,9 @@ def compute_perplexity_autoregressive(
     """
     Compute perplexity using true autoregressive evaluation (one token at a time).
 
-    This method processes tokens sequentially, using the KV-cache at each step.
-    Unlike teacher forcing, this actually exercises the cache optimizations and
-    will reveal any quality degradation from INT8 quantization or cross-layer sharing.
+    This method evaluates on INDEPENDENT chunks of max block_size tokens to avoid
+    cache trimming issues with absolute positional embeddings. Each chunk is
+    evaluated separately and results are averaged.
 
     Args:
         model: GPT model
@@ -237,64 +237,79 @@ def compute_perplexity_autoregressive(
     """
     model.eval()
     block_size = model.config.block_size
-
-    # Initialize KV-cache (for v1-v4)
-    kv_cache = None
-    if use_cache:
-        kv_cache = KVCache(
-            batch_size=1,
-            max_seq_len=block_size,
-            n_heads=model.config.n_head,
-            head_dim=model.config.n_embd // model.config.n_head,
-            n_layers=model.config.n_layer,
-            device=device,
-            dtype=next(model.parameters()).dtype,
-            cross_layer_sharing=cross_layer_sharing,
-            kv_cache_quant=model.config.kv_cache_quant,
-        )
-
-    nll_sum = 0.0
+    
+    # Split tokens into chunks of block_size to avoid cache trimming
+    # Each chunk is evaluated independently
+    num_chunks = (len(tokens) - 1 + block_size - 1) // block_size  # ceiling division
+    
+    total_nll = 0.0
     total_tokens = 0
-
-    pbar = tqdm(range(len(tokens) - 1), desc="Evaluating (autoregressive)")
-
-    for t in pbar:
-        current_token = tokens[t:t+1].unsqueeze(0).to(device)  # [1, 1]
-        target_token = tokens[t+1].to(device)  # scalar
-
-        # Handle context overflow: trim cache if at block_size
-        if kv_cache is not None and kv_cache.seq_len >= block_size:
-            kv_cache.trim(block_size - 1)
-
-        # Forward pass
-        if use_cache and kv_cache is not None:
-            logits, _, _ = model(
-                current_token,
-                use_cache=True,
+    
+    print(f"Evaluating {num_chunks} independent chunks of max {block_size} tokens each")
+    
+    for chunk_idx in range(num_chunks):
+        # Get chunk boundaries
+        start_idx = chunk_idx * block_size
+        end_idx = min(start_idx + block_size + 1, len(tokens))  # +1 for target
+        
+        if end_idx - start_idx <= 1:
+            continue  # Skip chunks with no predictions
+        
+        chunk_tokens = tokens[start_idx:end_idx]
+        chunk_len = len(chunk_tokens) - 1  # number of predictions
+        
+        # Initialize fresh KV-cache for this chunk (no trimming needed!)
+        kv_cache = None
+        if use_cache:
+            kv_cache = KVCache(
+                batch_size=1,
+                max_seq_len=block_size,
+                n_heads=model.config.n_head,
+                head_dim=model.config.n_embd // model.config.n_head,
+                n_layers=model.config.n_layer,
+                device=device,
+                dtype=next(model.parameters()).dtype,
                 cross_layer_sharing=cross_layer_sharing,
-                kv_cache=kv_cache
+                kv_cache_quant=model.config.kv_cache_quant,
             )
-        else:
-            # v0: No cache - must pass full context each time (capped at block_size)
-            ctx_start = max(0, t - block_size + 1)
-            context = tokens[ctx_start:t+1].unsqueeze(0).to(device)
-            logits, _, _ = model(context, use_cache=False)
-
-        # Get logits for next token prediction (last position)
-        next_logits = logits[0, -1, :]  # [vocab_size]
-
-        # Cross-entropy loss
-        loss = F.cross_entropy(next_logits.unsqueeze(0), target_token.unsqueeze(0))
-        nll_sum += loss.item()
-        total_tokens += 1
-
-        # Update progress bar
-        current_loss = nll_sum / total_tokens
-        pbar.set_postfix({'loss': f'{current_loss:.4f}'})
-
-    avg_loss = nll_sum / total_tokens
+        
+        chunk_nll = 0.0
+        pbar = tqdm(range(chunk_len), desc=f"Chunk {chunk_idx+1}/{num_chunks}", leave=False)
+        
+        for t in pbar:
+            current_token = chunk_tokens[t:t+1].unsqueeze(0).to(device)  # [1, 1]
+            target_token = chunk_tokens[t+1].to(device)  # scalar
+            
+            # Forward pass - no trimming needed since we stay within block_size!
+            if use_cache and kv_cache is not None:
+                logits, _, _ = model(
+                    current_token,
+                    use_cache=True,
+                    cross_layer_sharing=cross_layer_sharing,
+                    kv_cache=kv_cache
+                )
+            else:
+                # v0: No cache - pass full context (naturally capped at chunk length)
+                context = chunk_tokens[:t+1].unsqueeze(0).to(device)
+                logits, _, _ = model(context, use_cache=False)
+            
+            # Get logits for next token prediction (last position)
+            next_logits = logits[0, -1, :]  # [vocab_size]
+            
+            # Cross-entropy loss
+            loss = F.cross_entropy(next_logits.unsqueeze(0), target_token.unsqueeze(0))
+            chunk_nll += loss.item()
+            
+            # Update progress bar
+            current_loss = (total_nll + chunk_nll) / (total_tokens + t + 1)
+            pbar.set_postfix({'loss': f'{current_loss:.4f}'})
+        
+        total_nll += chunk_nll
+        total_tokens += chunk_len
+    
+    avg_loss = total_nll / total_tokens
     perplexity = math.exp(avg_loss)
-
+    
     return perplexity, avg_loss, total_tokens
 
 

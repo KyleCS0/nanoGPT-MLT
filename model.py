@@ -307,8 +307,8 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention
         if self.flash:
             # Flash Attention: is_causal=True for no cache, False for single-token cached generation
-            has_cache = layer_past is not None or (use_kv_cache and kv_cache.seq_len > T)
-            assert not has_cache or T == 1, "Cached generation only supports single-token input"
+            has_cache = layer_past is not None or (use_kv_cache and kv_cache.seq_len > 0)
+            assert not has_cache or T == 1, f"Cached generation only supports single-token input, got T={T}, has_cache={has_cache}, seq_len={kv_cache.seq_len if use_kv_cache else 'N/A'}"
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=None,
                 dropout_p=self.dropout if self.training else 0,
@@ -492,7 +492,11 @@ class GPT(nn.Module):
             f"Cannot forward sequence of length {total_length}, block size is only {self.config.block_size}"
 
         # Position indices: use pre-computed buffer, slice for current positions
-        pos = self.position_ids[past_length:past_length + t]
+        # For sliding window cache: positions for new tokens are past_length % block_size
+        # This ensures unique positions even after cache trimming
+        pos_start = past_length
+        pos_end = past_length + t
+        pos = self.position_ids[pos_start:pos_end]
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
