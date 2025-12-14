@@ -1832,6 +1832,83 @@ def export_latex_tables(results, output_dir):
     print(f"  Saved: {out_path}")
 
 
+def export_perplexity_markdown_table(results, output_dir):
+    """
+    Export perplexity results as a markdown table.
+    Includes all versions (v0-v4, v3a, v4a, etc.) with comparison to v1 baseline.
+    """
+    from collections import defaultdict
+
+    # Collect perplexity data
+    perplexity_data = {}
+    for (benchmark_name, version), data in results.items():
+        if benchmark_name == 'perplexity' and data:
+            perplexity_data[version] = data[-1]  # Latest result
+
+    if not perplexity_data:
+        print("  No perplexity data found. Skipping markdown table.")
+        return
+
+    # Get baseline
+    baseline_ppl = perplexity_data.get('v1', {}).get('perplexity')
+
+    # Build markdown table
+    lines = [
+        "# Perplexity Results",
+        "",
+        f"Generated from benchmark results. Baseline: v1 = {baseline_ppl:.2f}" if baseline_ppl else "",
+        "",
+        "| Version | Description | Perplexity | vs v1 | Tokens |",
+        "|---------|-------------|------------|-------|--------|",
+    ]
+
+    for version in sorted(perplexity_data.keys()):
+        data = perplexity_data[version]
+        ppl = data['perplexity']
+        desc = data.get('version_description', version)
+        tokens = data.get('num_tokens_evaluated', '-')
+
+        if version == 'v1':
+            vs_v1 = "baseline"
+        elif baseline_ppl:
+            ratio = ppl / baseline_ppl
+            if ratio > 10:
+                vs_v1 = f"**{ratio:.1f}x worse**"
+            elif ratio > 1.5:
+                vs_v1 = f"{ratio:.1f}x worse"
+            else:
+                vs_v1 = f"{ratio:.2f}x"
+        else:
+            vs_v1 = "-"
+
+        # Highlight experimental versions
+        if version in ['v3a', 'v4a']:
+            lines.append(f"| **{version}** | **{desc}** | **{ppl:.2f}** | {vs_v1} | {tokens} |")
+        elif ppl > 500:
+            lines.append(f"| {version} | {desc} | **{ppl:.2f}** | {vs_v1} | {tokens} |")
+        else:
+            lines.append(f"| {version} | {desc} | {ppl:.2f} | {vs_v1} | {tokens} |")
+
+    lines.extend([
+        "",
+        "---",
+        "",
+        "## Key Findings",
+        "",
+        "- **v0-v2**: Normal perplexity (~30-35)",
+        "- **v3, v4**: Cross-layer sharing breaks quality (~800 PPL)",
+        "- **v3a, v4a**: Q-alignment improves to ~220 PPL (3.4-3.8x better than v3/v4)",
+        "",
+        "See `CROSS_LAYER_RESEARCH.md` for detailed analysis.",
+    ])
+
+    # Write file
+    out_path = Path(output_dir) / 'perplexity_table.md'
+    with open(out_path, 'w') as f:
+        f.write("\n".join(lines))
+    print(f"  Saved: {out_path}")
+
+
 # =============================================================================
 # Split Comparison Plots: v0 vs v1, and KV-cache variants (v1 vs v2/v3/v4)
 # =============================================================================
@@ -2305,6 +2382,10 @@ def main():
     # Export LaTeX tables
     print("\nExporting LaTeX tables...")
     export_latex_tables(results, output_dir)
+
+    # Export perplexity markdown table
+    print("\nExporting perplexity markdown table...")
+    export_perplexity_markdown_table(results, output_dir)
 
     print()
     print(f"All plots saved to {output_dir}")
