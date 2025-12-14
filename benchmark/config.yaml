@@ -1,22 +1,23 @@
 # benchmark/config.yaml
 
-# Model configuration
+# Model configuration (GPT-2 Medium: 345M params)
 model_config:
-  n_layer: 12
-  n_head: 12
-  n_embd: 768
+  n_layer: 24
+  n_head: 16
+  n_embd: 1024
   block_size: 1024
   vocab_size: 50257
-
+pretrained: gpt2-medium
 # Execution configuration
 dtype: 'bfloat16' # 'float32', 'bfloat16', or 'float16'
 prompt_length: 32
 # More T values for smoother curves and clearer scaling (up to context limit)
 T_values: [32, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024]
 batch_size: 1
-num_warmup_runs: 3
-num_measure_runs: 10
+num_warmup_runs: 10
+num_measure_runs: 20
 T_star: 512 # For per-phase timing
+capacity_T: 128 # Generation length for max batch capacity test
 seed: 1337
 
 # Output

@@ -15,6 +15,136 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+class KVCache:
+    """
+    Pre-allocated KV cache for efficient autoregressive generation.
+
+    Avoids O(T²) memory allocations from torch.cat by using pre-allocated
+    buffers with in-place slice assignment.
+    """
+
+    def __init__(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        n_heads: int,
+        head_dim: int,
+        n_layers: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        cross_layer_sharing: bool = False,
+        kv_cache_quant: bool = False,
+    ):
+        self.batch_size = batch_size
+        self.max_seq_len = max_seq_len
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.n_layers = n_layers
+        self.cross_layer_sharing = cross_layer_sharing
+        self.kv_cache_quant = kv_cache_quant
+        self.device = device
+        self.dtype = dtype
+
+        # Number of cache entries (half for cross-layer sharing)
+        self.n_cache_layers = n_layers // 2 if cross_layer_sharing else n_layers
+
+        # Pre-allocate buffers
+        cache_shape = (self.n_cache_layers, batch_size, n_heads, max_seq_len, head_dim)
+
+        if kv_cache_quant:
+            # INT8 quantized cache
+            self.k_cache = torch.empty(cache_shape, device=device, dtype=torch.int8)
+            self.v_cache = torch.empty(cache_shape, device=device, dtype=torch.int8)
+            # Per-token scales (one scale per position per layer)
+            self.k_scale = torch.ones((self.n_cache_layers, max_seq_len), device=device, dtype=dtype)
+            self.v_scale = torch.ones((self.n_cache_layers, max_seq_len), device=device, dtype=dtype)
+        else:
+            # FP16/BF16 cache
+            self.k_cache = torch.empty(cache_shape, device=device, dtype=dtype)
+            self.v_cache = torch.empty(cache_shape, device=device, dtype=dtype)
+            self.k_scale = None
+            self.v_scale = None
+
+        self.seq_len = 0  # Current filled length
+
+    def update(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor,
+               k_scale: torch.Tensor = None, v_scale: torch.Tensor = None):
+        """
+        Update cache for a layer with new K, V values.
+
+        Args:
+            layer_idx: Cache layer index (not model layer index)
+            k: New key tensor (B, nh, T_new, hs) - quantized if kv_cache_quant
+            v: New value tensor (B, nh, T_new, hs) - quantized if kv_cache_quant
+            k_scale, v_scale: Scales for INT8 quantization
+
+        Returns:
+            T_new: Number of new tokens added (for get() to include them)
+        """
+        T_new = k.size(2)
+        start_pos = self.seq_len
+        end_pos = start_pos + T_new
+
+        # In-place assignment (no allocation!)
+        self.k_cache[layer_idx, :, :, start_pos:end_pos, :] = k
+        self.v_cache[layer_idx, :, :, start_pos:end_pos, :] = v
+
+        if self.kv_cache_quant and k_scale is not None:
+            # Store per-token scales (not per-layer!)
+            self.k_scale[layer_idx, start_pos:end_pos] = k_scale
+            self.v_scale[layer_idx, start_pos:end_pos] = v_scale
+
+        return T_new
+
+    def get(self, layer_idx: int, include_new: int = 0):
+        """
+        Get cached K, V for a layer.
+
+        Args:
+            layer_idx: Cache layer index
+            include_new: Include this many tokens beyond seq_len (for just-written tokens)
+
+        Returns:
+            For FP16: (k, v) each of shape (B, nh, seq_len + include_new, hs)
+            For INT8: ((k_quant, k_scale), (v_quant, v_scale))
+        """
+        end_pos = self.seq_len + include_new
+        k = self.k_cache[layer_idx, :, :, :end_pos, :]
+        v = self.v_cache[layer_idx, :, :, :end_pos, :]
+
+        if self.kv_cache_quant:
+            # Return per-token scales for correct dequantization
+            return ((k, self.k_scale[layer_idx, :end_pos]), (v, self.v_scale[layer_idx, :end_pos]))
+        else:
+            return (k, v)
+
+    def advance(self, n_tokens: int = 1):
+        """Advance the sequence position after processing tokens."""
+        self.seq_len += n_tokens
+
+    def trim(self, keep_len: int):
+        """
+        Trim cache to keep only the last keep_len tokens (for sliding window).
+        Uses in-place copy to avoid allocation.
+        """
+        if self.seq_len <= keep_len:
+            return
+
+        # Shift the last keep_len tokens to the beginning
+        start = self.seq_len - keep_len
+        self.k_cache[:, :, :, :keep_len, :] = self.k_cache[:, :, :, start:self.seq_len, :].clone()
+        self.v_cache[:, :, :, :keep_len, :] = self.v_cache[:, :, :, start:self.seq_len, :].clone()
+        # Also shift per-token scales if INT8 quantized
+        if self.kv_cache_quant:
+            self.k_scale[:, :keep_len] = self.k_scale[:, start:self.seq_len].clone()
+            self.v_scale[:, :keep_len] = self.v_scale[:, start:self.seq_len].clone()
+        self.seq_len = keep_len
+
+    def reset(self):
+        """Reset cache for new sequence."""
+        self.seq_len = 0
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -51,7 +181,8 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, layer_past=None, use_cache=False, is_cache_owner=True):
+    def forward(self, x, layer_past=None, use_cache=False, is_cache_owner=True,
+                kv_cache: 'KVCache' = None, cache_layer_idx: int = None):
         """
         Forward pass with optional KV-cache support.
 
@@ -60,18 +191,27 @@ class CausalSelfAttention(nn.Module):
                - Training: T = sequence length
                - Cached inference: T = 1 (new token only)
             layer_past: Optional tuple (past_key, past_value) each (B, nh, T_past, hs)
+                       [DEPRECATED: use kv_cache instead for better performance]
             use_cache: If True, return updated KV cache
             is_cache_owner: If True, this layer is responsible for quantizing the cache
+            kv_cache: Optional KVCache object for pre-allocated cache (avoids torch.cat)
+            cache_layer_idx: Layer index in the cache (required if kv_cache is provided)
 
         Returns:
             y: Output tensor (B, T, C)
-            present: Tuple (key, value) if use_cache=True, else None
+            present: Tuple (key, value) if use_cache=True and no kv_cache, else None
         """
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        # Determine if we're using the optimized KVCache path
+        use_kv_cache = kv_cache is not None and cache_layer_idx is not None
+
         # In cross-layer sharing, borrower layers (is_cache_owner=False) with a valid cache
         # should only compute Q and reuse K,V from the cache owner.
-        can_borrow = self.config.cross_layer_sharing and not is_cache_owner and layer_past is not None
+        # Note: with KVCache, owner writes before borrower reads (same forward pass),
+        # so borrower can always borrow via include_new=T, even when seq_len=0.
+        has_past = layer_past is not None or use_kv_cache
+        can_borrow = self.config.cross_layer_sharing and not is_cache_owner and has_past
 
         if can_borrow:
             # Borrower layer: compute Q only, K and V will be taken from cache
@@ -85,48 +225,94 @@ class CausalSelfAttention(nn.Module):
             k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # concatenate with past KV if available
-        if layer_past is not None:
+        # Handle KV cache - optimized path using pre-allocated KVCache
+        if use_kv_cache:
+            if can_borrow:
+                # Borrower: just get K,V from cache (no update needed)
+                # include_new=T because owner has written new tokens but advance() not called yet
+                layer_cache = kv_cache.get(cache_layer_idx, include_new=T)
+                if self.config.kv_cache_quant:
+                    (k_quant, k_scale), (v_quant, v_scale) = layer_cache
+                    # Per-token dequantization: scale is (seq_len,), broadcast to (1, 1, seq_len, 1)
+                    k = k_quant.to(q.dtype) * k_scale.view(1, 1, -1, 1)
+                    v = v_quant.to(q.dtype) * v_scale.view(1, 1, -1, 1)
+                else:
+                    k, v = layer_cache
+            else:
+                # Owner: update cache in-place, then get full K,V
+                if self.config.kv_cache_quant:
+                    # Quantize new K,V
+                    k_absmax = k.abs().max()
+                    k_scale = k_absmax / 127.0 if k_absmax > 0 else torch.tensor(1.0, device=k.device, dtype=k.dtype)
+                    k_quant = (k / k_scale).round().clamp(-127, 127).to(torch.int8)
+                    v_absmax = v.abs().max()
+                    v_scale = v_absmax / 127.0 if v_absmax > 0 else torch.tensor(1.0, device=v.device, dtype=v.dtype)
+                    v_quant = (v / v_scale).round().clamp(-127, 127).to(torch.int8)
+                    # Update cache in-place
+                    kv_cache.update(cache_layer_idx, k_quant, v_quant, k_scale, v_scale)
+                else:
+                    # Update cache in-place (no quantization)
+                    kv_cache.update(cache_layer_idx, k, v)
+
+                # Get full K,V from cache (past + new, as a view - no allocation!)
+                # include_new=T because we just wrote T tokens but advance() not called yet
+                layer_cache = kv_cache.get(cache_layer_idx, include_new=T)
+                if self.config.kv_cache_quant:
+                    (k_quant, k_scale), (v_quant, v_scale) = layer_cache
+                    # Per-token dequantization: scale is (seq_len,), broadcast to (1, 1, seq_len, 1)
+                    k = k_quant.to(q.dtype) * k_scale.view(1, 1, -1, 1)
+                    v = v_quant.to(q.dtype) * v_scale.view(1, 1, -1, 1)
+                else:
+                    k, v = layer_cache
+
+            present = None  # With KVCache, we don't return presents
+
+        # Legacy path using layer_past (torch.cat, kept for backward compatibility)
+        elif layer_past is not None:
             if self.config.kv_cache_quant:
-                # Dequantize
+                # INT8 path: dequantize cache, concat with new K,V
                 (past_key_q, past_key_s), (past_value_q, past_value_s) = layer_past
                 past_key = past_key_q.to(q.dtype) * past_key_s
                 past_value = past_value_q.to(q.dtype) * past_value_s
+                if can_borrow:
+                    k, v = past_key, past_value
+                else:
+                    k = torch.cat([past_key, k], dim=2)
+                    v = torch.cat([past_value, v], dim=2)
             else:
                 past_key, past_value = layer_past
-            
-            if can_borrow:
-                # Borrower uses cache owner's K,V directly
-                k, v = past_key, past_value
-            else:
-                # Owner concatenates new K,V with past
-                k = torch.cat([past_key, k], dim=2)   # (B, nh, T_past + T, hs)
-                v = torch.cat([past_value, v], dim=2) # (B, nh, T_past + T, hs)
+                if can_borrow:
+                    k, v = past_key, past_value
+                else:
+                    k = torch.cat([past_key, k], dim=2)
+                    v = torch.cat([past_value, v], dim=2)
 
-        # prepare cache to return
-        if use_cache:
-            # if cross-layer sharing is on, only owners should quantize and return a cache
-            # but we compute it here and let the GPT model decide whether to store it
-            if self.config.kv_cache_quant and is_cache_owner:
-                # Quantize
-                k_scale = k.abs().max(dim=-1, keepdim=True).values / 127.0
-                k_quant = (k / k_scale).round().to(torch.int8)
-                v_scale = v.abs().max(dim=-1, keepdim=True).values / 127.0
-                v_quant = (v / v_scale).round().to(torch.int8)
-                present = ((k_quant, k_scale), (v_quant, v_scale))
+        # prepare cache to return (only for legacy path, KVCache handles its own updates)
+        if not use_kv_cache:
+            if use_cache:
+                if self.config.kv_cache_quant and is_cache_owner:
+                    # Quantize for storage (saves memory, costs some compute)
+                    k_absmax = k.abs().max()
+                    k_scale = k_absmax / 127.0 if k_absmax > 0 else torch.tensor(1.0, device=k.device, dtype=k.dtype)
+                    k_quant = (k / k_scale).round().clamp(-127, 127).to(torch.int8)
+                    v_absmax = v.abs().max()
+                    v_scale = v_absmax / 127.0 if v_absmax > 0 else torch.tensor(1.0, device=v.device, dtype=v.dtype)
+                    v_quant = (v / v_scale).round().clamp(-127, 127).to(torch.int8)
+                    present = ((k_quant, k_scale), (v_quant, v_scale))
+                else:
+                    present = (k, v)
             else:
-                present = (k, v)
-        else:
-            present = None
+                present = None
 
         # causal self-attention
         if self.flash:
             # Flash Attention: is_causal=True for no cache, False for single-token cached generation
-            assert layer_past is None or T == 1, "Cached generation only supports single-token input"
+            has_cache = layer_past is not None or (use_kv_cache and kv_cache.seq_len > 0)
+            assert not has_cache or T == 1, f"Cached generation only supports single-token input, got T={T}, has_cache={has_cache}, seq_len={kv_cache.seq_len if use_kv_cache else 'N/A'}"
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=None,
                 dropout_p=self.dropout if self.training else 0,
-                is_causal=(layer_past is None)
+                is_causal=(not has_cache)
             )
         else:
             # manual implementation of attention
@@ -137,7 +323,7 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).reshape(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -168,7 +354,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, layer_past=None, use_cache=False, is_cache_owner=True):
+    def forward(self, x, layer_past=None, use_cache=False, is_cache_owner=True,
+                kv_cache: 'KVCache' = None, cache_layer_idx: int = None):
         """
         Forward pass with optional KV-cache support.
 
@@ -177,12 +364,17 @@ class Block(nn.Module):
             layer_past: Optional KV cache for this block's attention layer
             use_cache: If True, return updated KV cache
             is_cache_owner: If True, this layer is responsible for quantizing the cache
+            kv_cache: Optional KVCache object for pre-allocated cache
+            cache_layer_idx: Layer index in the cache
 
         Returns:
             x: Output tensor (B, T, C)
-            present: KV cache tuple if use_cache=True, else None
+            present: KV cache tuple if use_cache=True and no kv_cache, else None
         """
-        attn_out, present = self.attn(self.ln_1(x), layer_past=layer_past, use_cache=use_cache, is_cache_owner=is_cache_owner)
+        attn_out, present = self.attn(
+            self.ln_1(x), layer_past=layer_past, use_cache=use_cache,
+            is_cache_owner=is_cache_owner, kv_cache=kv_cache, cache_layer_idx=cache_layer_idx
+        )
         x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
         return x, present
@@ -198,6 +390,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     cross_layer_sharing: bool = False # Toggles the cross-layer sharing hack
     kv_cache_quant: bool = False # Toggles INT8 quantization for KV cache
+    cross_layer_q_alignment: bool = False # Align borrower Q weights with owner (experimental)
 
 class GPT(nn.Module):
 
@@ -228,6 +421,9 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
+        # Pre-compute position indices for efficient inference
+        self.register_buffer('position_ids', torch.arange(config.block_size, dtype=torch.long))
+
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -251,7 +447,8 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, past_key_values=None, use_cache=False, cross_layer_sharing=None):
+    def forward(self, idx, targets=None, past_key_values=None, use_cache=False,
+                cross_layer_sharing=None, kv_cache: 'KVCache' = None):
         """
         Forward pass with optional KV-cache support.
 
@@ -260,23 +457,30 @@ class GPT(nn.Module):
             targets: Optional target indices for loss computation (B, T)
             past_key_values: Optional list of KV caches, one per layer
                             Each element is (key, value) tuple
-            use_cache: If True, return updated KV caches
+                            [DEPRECATED: use kv_cache for better performance]
+            use_cache: If True, return updated KV caches (ignored if kv_cache provided)
             cross_layer_sharing: If True, enable cross-layer sharing hack
+            kv_cache: Optional KVCache object for pre-allocated cache (avoids torch.cat)
 
         Returns:
             logits: Output logits (B, T, vocab_size) or (B, 1, vocab_size) if no targets
             loss: Cross-entropy loss if targets provided, else None
-            present_key_values: List of KV caches if use_cache=True, else None
+            present_key_values: List of KV caches if use_cache=True and no kv_cache, else None
         """
         device = idx.device
         b, t = idx.size()
 
         # Determine if we are using cross-layer sharing
         use_cls = cross_layer_sharing if cross_layer_sharing is not None else self.config.cross_layer_sharing
-        
+
+        # Determine if using optimized KVCache path
+        use_kv_cache = kv_cache is not None
+
         # Calculate position offset from cache
         past_length = 0
-        if past_key_values is not None:
+        if use_kv_cache:
+            past_length = kv_cache.seq_len
+        elif past_key_values is not None:
             if self.config.kv_cache_quant:
                 past_length = past_key_values[0][0][0].size(2)  # (B, nh, T_past, hs)
             else:
@@ -287,29 +491,46 @@ class GPT(nn.Module):
         assert total_length <= self.config.block_size, \
             f"Cannot forward sequence of length {total_length}, block size is only {self.config.block_size}"
 
-        # Position indices: offset by past_length when using cache
-        pos = torch.arange(past_length, past_length + t, dtype=torch.long, device=device)
+        # Position indices: use pre-computed buffer, slice for current positions
+        # For sliding window cache: positions for new tokens are past_length % block_size
+        # This ensures unique positions even after cache trimming
+        pos_start = past_length
+        pos_end = past_length + t
+        pos = self.position_ids[pos_start:pos_end]
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
 
-        # Process through transformer blocks, collecting KV caches
-        present_key_values = [] if use_cache else None
+        # Process through transformer blocks
+        present_key_values = [] if (use_cache and not use_kv_cache) else None
         for i, block in enumerate(self.transformer.h):
             if use_cls:
                 cache_idx = i // 2 # e.g. layer 0,1 -> 0; layer 2,3 -> 1
                 is_cache_owner = (i % 2 == 0)
                 layer_past = past_key_values[cache_idx] if past_key_values is not None else None
             else:
+                cache_idx = i
                 is_cache_owner = True
                 layer_past = past_key_values[i] if past_key_values is not None else None
-            x, present = block(x, layer_past=layer_past, use_cache=use_cache, is_cache_owner=is_cache_owner)
-            if use_cache:
+
+            # Pass KVCache if using optimized path
+            # Note: cache_layer_idx must be passed to BOTH owner and borrower layers
+            x, present = block(
+                x, layer_past=layer_past, use_cache=use_cache, is_cache_owner=is_cache_owner,
+                kv_cache=kv_cache if use_kv_cache else None,
+                cache_layer_idx=cache_idx if use_kv_cache else None
+            )
+
+            if use_cache and not use_kv_cache:
                 # with cross-layer sharing, only even layers store their cache
                 if not use_cls or is_cache_owner:
                     present_key_values.append(present)
+
+        # Advance KVCache position after all layers have updated it
+        if use_kv_cache:
+            kv_cache.advance(t)
 
         x = self.transformer.ln_f(x)
 
@@ -331,12 +552,14 @@ class GPT(nn.Module):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        self.position_ids = self.position_ids[:block_size]
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
-    def from_pretrained(cls, model_type, override_args=None, override_kv_cache_quant=None):
+    def from_pretrained(cls, model_type, override_args=None, override_kv_cache_quant=None,
+                        override_cross_layer_q_alignment=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
@@ -363,6 +586,10 @@ class GPT(nn.Module):
         if override_kv_cache_quant is not None:
             print(f"overriding kv_cache_quant to {override_kv_cache_quant}")
             config_args['kv_cache_quant'] = override_kv_cache_quant
+        # override cross_layer_q_alignment if desired (for experimental versions)
+        if override_cross_layer_q_alignment is not None:
+            print(f"overriding cross_layer_q_alignment to {override_cross_layer_q_alignment}")
+            config_args['cross_layer_q_alignment'] = override_cross_layer_q_alignment
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
@@ -381,7 +608,9 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len([k for k in sd_keys if 'c_attn_q' not in k]), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        # Filter out c_attn_q (our addition for cross-layer sharing) and position_ids (our registered buffer)
+        sd_keys_ours = [k for k in sd_keys if 'c_attn_q' not in k and k != 'position_ids']
+        assert len(sd_keys_hf) == len(sd_keys_ours), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys_ours)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -395,10 +624,20 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         
         # Migrate weights for the new c_attn_q layer
+        # If cross_layer_q_alignment is enabled, borrower layers (odd indices) use the
+        # OWNER's Q weights so Q and K come from the same learned weight space.
+        use_q_alignment = getattr(config, 'cross_layer_q_alignment', False)
         with torch.no_grad():
-            for h in model.transformer.h:
-                q_weight = h.attn.c_attn.weight[:config.n_embd, :]
-                q_bias = h.attn.c_attn.bias[:config.n_embd]
+            for i, h in enumerate(model.transformer.h):
+                if use_q_alignment and i % 2 == 1:
+                    # Borrower layer with Q-alignment: use owner's Q weights
+                    owner = model.transformer.h[i - 1].attn
+                    q_weight = owner.c_attn.weight[:config.n_embd, :]
+                    q_bias = owner.c_attn.bias[:config.n_embd]
+                else:
+                    # Owner layer or no Q-alignment: use own Q weights
+                    q_weight = h.attn.c_attn.weight[:config.n_embd, :]
+                    q_bias = h.attn.c_attn.bias[:config.n_embd]
                 h.attn.c_attn_q.weight.copy_(q_weight)
                 h.attn.c_attn_q.bias.copy_(q_bias)
 
@@ -464,61 +703,75 @@ class GPT(nn.Module):
         Returns:
             idx: Generated sequence (B, T + max_new_tokens)
         """
-        past_key_values = None
+        B, T = idx.size()
+        device = idx.device
 
-        for _ in range(max_new_tokens):
+        # Pre-allocate output buffer to avoid torch.cat every iteration
+        output = torch.empty(B, T + max_new_tokens, dtype=idx.dtype, device=device)
+        output[:, :T] = idx
+        cur_pos = T  # Current write position
+
+        # Determine cross-layer sharing setting
+        use_cls = cross_layer_sharing if cross_layer_sharing is not None else self.config.cross_layer_sharing
+
+        # Create pre-allocated KVCache for optimized generation
+        kv_cache = None
+        if use_cache:
+            # Get model dtype from parameters
+            dtype = next(self.parameters()).dtype
+            kv_cache = KVCache(
+                batch_size=B,
+                max_seq_len=self.config.block_size,
+                n_heads=self.config.n_head,
+                head_dim=self.config.n_embd // self.config.n_head,
+                n_layers=self.config.n_layer,
+                device=device,
+                dtype=dtype,
+                cross_layer_sharing=use_cls,
+                kv_cache_quant=self.config.kv_cache_quant,
+            )
+
+        for i in range(max_new_tokens):
             # Determine what to feed the model
-            if use_cache and past_key_values is not None:
+            if use_cache and kv_cache.seq_len > 0:
                 # Cached generation: only feed the last token
-                idx_cond = idx[:, -1:]
+                idx_cond = output[:, cur_pos - 1:cur_pos]
             else:
                 # First iteration or non-cached: feed full sequence (up to block_size)
-                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                idx_cond = output[:, :cur_pos]
+                if idx_cond.size(1) > self.config.block_size:
+                    idx_cond = idx_cond[:, -self.config.block_size:]
 
-            # Forward pass
-            logits, _, past_key_values = self(
+            # Forward pass with pre-allocated KVCache
+            logits, _, _ = self(
                 idx_cond,
-                past_key_values=past_key_values if use_cache else None,
                 use_cache=use_cache,
-                cross_layer_sharing=cross_layer_sharing
+                cross_layer_sharing=cross_layer_sharing,
+                kv_cache=kv_cache
             )
 
             # Handle cache overflow: if we exceed block_size, trim the cache
-            if use_cache and past_key_values is not None:
-                if self.config.kv_cache_quant:
-                    cache_len = past_key_values[0][0][0].size(2)
-                else:
-                    cache_len = past_key_values[0][0].size(2)
-                if cache_len >= self.config.block_size:
-                    # Trim cache to block_size - 1 to make room for next token
-                    if self.config.kv_cache_quant:
-                        past_key_values = [
-                            ((k[0][:, :, -(self.config.block_size - 1):, :], k[1]),
-                             (v[0][:, :, -(self.config.block_size - 1):, :], v[1]))
-                            for k, v in past_key_values
-                        ]
-                    else:
-                        past_key_values = [
-                            (k[:, :, -(self.config.block_size - 1):, :],
-                             v[:, :, -(self.config.block_size - 1):, :])
-                            for k, v in past_key_values
-                        ]
+            if use_cache and kv_cache.seq_len >= self.config.block_size:
+                # Trim cache to block_size - 1 to make room for next token
+                kv_cache.trim(self.config.block_size - 1)
 
             # Pluck the logits at the final step and scale by temperature
             logits = logits[:, -1, :] / temperature
 
-            # Optionally crop to top k
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-
-            # Apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1)
-
             # Sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+            if top_k is not None:
+                # Optimized top-k: only compute softmax on top-k values
+                k = min(top_k, logits.size(-1))
+                topk_logits, topk_indices = torch.topk(logits, k)
+                topk_probs = F.softmax(topk_logits, dim=-1)
+                sampled_idx = torch.multinomial(topk_probs, num_samples=1)
+                idx_next = torch.gather(topk_indices, dim=-1, index=sampled_idx)
+            else:
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
 
-            # Append to sequence
-            idx = torch.cat((idx, idx_next), dim=1)
+            # Write to pre-allocated buffer (no allocation)
+            output[:, cur_pos] = idx_next.squeeze(-1)
+            cur_pos += 1
 
-        return idx
+        return output
