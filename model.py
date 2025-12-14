@@ -390,6 +390,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     cross_layer_sharing: bool = False # Toggles the cross-layer sharing hack
     kv_cache_quant: bool = False # Toggles INT8 quantization for KV cache
+    cross_layer_q_alignment: bool = False # Align borrower Q weights with owner (experimental)
 
 class GPT(nn.Module):
 
@@ -553,7 +554,8 @@ class GPT(nn.Module):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
-    def from_pretrained(cls, model_type, override_args=None, override_kv_cache_quant=None):
+    def from_pretrained(cls, model_type, override_args=None, override_kv_cache_quant=None,
+                        override_cross_layer_q_alignment=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
@@ -580,6 +582,10 @@ class GPT(nn.Module):
         if override_kv_cache_quant is not None:
             print(f"overriding kv_cache_quant to {override_kv_cache_quant}")
             config_args['kv_cache_quant'] = override_kv_cache_quant
+        # override cross_layer_q_alignment if desired (for experimental versions)
+        if override_cross_layer_q_alignment is not None:
+            print(f"overriding cross_layer_q_alignment to {override_cross_layer_q_alignment}")
+            config_args['cross_layer_q_alignment'] = override_cross_layer_q_alignment
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
@@ -614,10 +620,20 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         
         # Migrate weights for the new c_attn_q layer
+        # If cross_layer_q_alignment is enabled, borrower layers (odd indices) use the
+        # OWNER's Q weights so Q and K come from the same learned weight space.
+        use_q_alignment = getattr(config, 'cross_layer_q_alignment', False)
         with torch.no_grad():
-            for h in model.transformer.h:
-                q_weight = h.attn.c_attn.weight[:config.n_embd, :]
-                q_bias = h.attn.c_attn.bias[:config.n_embd]
+            for i, h in enumerate(model.transformer.h):
+                if use_q_alignment and i % 2 == 1:
+                    # Borrower layer with Q-alignment: use owner's Q weights
+                    owner = model.transformer.h[i - 1].attn
+                    q_weight = owner.c_attn.weight[:config.n_embd, :]
+                    q_bias = owner.c_attn.bias[:config.n_embd]
+                else:
+                    # Owner layer or no Q-alignment: use own Q weights
+                    q_weight = h.attn.c_attn.weight[:config.n_embd, :]
+                    q_bias = h.attn.c_attn.bias[:config.n_embd]
                 h.attn.c_attn_q.weight.copy_(q_weight)
                 h.attn.c_attn_q.bias.copy_(q_bias)
 

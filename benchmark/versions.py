@@ -50,6 +50,21 @@ VERSIONS = {
         'kv_cache_quant': True,
         'cross_layer_sharing': True,
     },
+    # Experimental versions: Q-weight alignment for cross-layer sharing research
+    'v3a': {
+        'description': '[EXP] Cross-layer + Q-aligned',
+        'use_cache': True,
+        'kv_cache_quant': False,
+        'cross_layer_sharing': True,
+        'cross_layer_q_alignment': True,
+    },
+    'v4a': {
+        'description': '[EXP] Cross-layer + INT8 + Q-aligned',
+        'use_cache': True,
+        'kv_cache_quant': True,
+        'cross_layer_sharing': True,
+        'cross_layer_q_alignment': True,
+    },
 }
 
 
@@ -105,7 +120,8 @@ def create_model(version: str, base_config: dict = None, pretrained: str = None)
         # Load pretrained with version-specific settings
         model = GPT.from_pretrained(
             pretrained,
-            override_kv_cache_quant=v_config['kv_cache_quant']
+            override_kv_cache_quant=v_config['kv_cache_quant'],
+            override_cross_layer_q_alignment=v_config.get('cross_layer_q_alignment')
         )
         # Set cross_layer_sharing in config (used at runtime)
         model.config.cross_layer_sharing = v_config['cross_layer_sharing']
