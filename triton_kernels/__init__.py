@@ -6,3 +6,4 @@ from .int8_quant import (
     test_correctness,
     benchmark,
 )
+from .profile_quant import theoretical_analysis
