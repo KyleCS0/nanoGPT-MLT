@@ -31,23 +31,30 @@ def _quant_kernel(
     BLOCK_K: tl.constexpr,
 ):
     row = tl.program_id(0)
+    x_row = x_ptr + row * stride_xm
+    q_row = q_ptr + row * stride_qm
 
-    offs_k = tl.arange(0, BLOCK_K)
-    mask = offs_k < K
+    # compute amax across row
+    amax = 0.0
+    for k_start in range(0, K, BLOCK_K):
+        offs = k_start + tl.arange(0, BLOCK_K)
+        mask = offs < K
+        x = tl.load(x_row + offs * stride_xk, mask=mask, other=0.0)
+        amax = tl.maximum(amax, tl.max(tl.abs(x)))
 
-    x = tl.load(x_ptr + row * stride_xm + offs_k * stride_xk, mask=mask, other=0.0)
-
-    amax = tl.max(tl.abs(x))
     scale = tl.where(amax > 0, amax / 127.0, 1.0)
     inv_scale = tl.where(amax > 0, 127.0 / amax, 0.0)
-
     tl.store(scale_ptr + row, scale)
 
-    q = x.to(tl.float32) * inv_scale
-    q = tl.floor(q + 0.5)
-    q = tl.maximum(tl.minimum(q, 127.0), -127.0)
-
-    tl.store(q_ptr + row * stride_qm + offs_k * stride_qk, q.to(tl.int8), mask=mask)
+    # quantize
+    for k_start in range(0, K, BLOCK_K):
+        offs = k_start + tl.arange(0, BLOCK_K)
+        mask = offs < K
+        x = tl.load(x_row + offs * stride_xk, mask=mask, other=0.0)
+        q = x.to(tl.float32) * inv_scale
+        q = tl.floor(q + 0.5)
+        q = tl.maximum(tl.minimum(q, 127.0), -127.0)
+        tl.store(q_row + offs * stride_qk, q.to(tl.int8), mask=mask)
 
 
 def triton_int8_quant(x):
