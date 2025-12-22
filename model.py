@@ -15,6 +15,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# Triton INT8 quantization (optional, for v2t)
+try:
+    from triton_kernels import triton_int8_quant, triton_int8_quant_per_tensor
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
 class KVCache:
     """
     Pre-allocated KV cache for efficient autoregressive generation.
@@ -55,9 +62,10 @@ class KVCache:
             # INT8 quantized cache
             self.k_cache = torch.empty(cache_shape, device=device, dtype=torch.int8)
             self.v_cache = torch.empty(cache_shape, device=device, dtype=torch.int8)
-            # Per-token scales (one scale per position per layer)
-            self.k_scale = torch.ones((self.n_cache_layers, max_seq_len), device=device, dtype=dtype)
-            self.v_scale = torch.ones((self.n_cache_layers, max_seq_len), device=device, dtype=dtype)
+            # Per-row scales (one scale per head per position per layer)
+            scale_shape = (self.n_cache_layers, batch_size, n_heads, max_seq_len)
+            self.k_scale = torch.ones(scale_shape, device=device, dtype=torch.float32)
+            self.v_scale = torch.ones(scale_shape, device=device, dtype=torch.float32)
         else:
             # FP16/BF16 cache
             self.k_cache = torch.empty(cache_shape, device=device, dtype=dtype)
@@ -90,9 +98,9 @@ class KVCache:
         self.v_cache[layer_idx, :, :, start_pos:end_pos, :] = v
 
         if self.kv_cache_quant and k_scale is not None:
-            # Store per-token scales (not per-layer!)
-            self.k_scale[layer_idx, start_pos:end_pos] = k_scale
-            self.v_scale[layer_idx, start_pos:end_pos] = v_scale
+            # Store per-row scales: (B, nh, T_new) -> cache[:, :, :, start:end]
+            self.k_scale[layer_idx, :, :, start_pos:end_pos] = k_scale
+            self.v_scale[layer_idx, :, :, start_pos:end_pos] = v_scale
 
         return T_new
 
@@ -113,8 +121,8 @@ class KVCache:
         v = self.v_cache[layer_idx, :, :, :end_pos, :]
 
         if self.kv_cache_quant:
-            # Return per-token scales for correct dequantization
-            return ((k, self.k_scale[layer_idx, :end_pos]), (v, self.v_scale[layer_idx, :end_pos]))
+            # Return per-row scales: (B, nh, seq_len)
+            return ((k, self.k_scale[layer_idx, :, :, :end_pos]), (v, self.v_scale[layer_idx, :, :, :end_pos]))
         else:
             return (k, v)
 
@@ -134,10 +142,10 @@ class KVCache:
         start = self.seq_len - keep_len
         self.k_cache[:, :, :, :keep_len, :] = self.k_cache[:, :, :, start:self.seq_len, :].clone()
         self.v_cache[:, :, :, :keep_len, :] = self.v_cache[:, :, :, start:self.seq_len, :].clone()
-        # Also shift per-token scales if INT8 quantized
+        # Also shift per-row scales if INT8 quantized
         if self.kv_cache_quant:
-            self.k_scale[:, :keep_len] = self.k_scale[:, start:self.seq_len].clone()
-            self.v_scale[:, :keep_len] = self.v_scale[:, start:self.seq_len].clone()
+            self.k_scale[:, :, :, :keep_len] = self.k_scale[:, :, :, start:self.seq_len].clone()
+            self.v_scale[:, :, :, :keep_len] = self.v_scale[:, :, :, start:self.seq_len].clone()
         self.seq_len = keep_len
 
     def reset(self):
@@ -233,21 +241,30 @@ class CausalSelfAttention(nn.Module):
                 layer_cache = kv_cache.get(cache_layer_idx, include_new=T)
                 if self.config.kv_cache_quant:
                     (k_quant, k_scale), (v_quant, v_scale) = layer_cache
-                    # Per-token dequantization: scale is (seq_len,), broadcast to (1, 1, seq_len, 1)
-                    k = k_quant.to(q.dtype) * k_scale.view(1, 1, -1, 1)
-                    v = v_quant.to(q.dtype) * v_scale.view(1, 1, -1, 1)
+                    # Per-row dequantization: scale is (B, nh, seq_len), broadcast to (B, nh, seq_len, 1)
+                    k = (k_quant.float() * k_scale.unsqueeze(-1)).to(q.dtype)
+                    v = (v_quant.float() * v_scale.unsqueeze(-1)).to(q.dtype)
                 else:
                     k, v = layer_cache
             else:
                 # Owner: update cache in-place, then get full K,V
                 if self.config.kv_cache_quant:
-                    # Quantize new K,V
-                    k_absmax = k.abs().max()
-                    k_scale = k_absmax / 127.0 if k_absmax > 0 else torch.tensor(1.0, device=k.device, dtype=k.dtype)
-                    k_quant = (k / k_scale).round().clamp(-127, 127).to(torch.int8)
-                    v_absmax = v.abs().max()
-                    v_scale = v_absmax / 127.0 if v_absmax > 0 else torch.tensor(1.0, device=v.device, dtype=v.dtype)
-                    v_quant = (v / v_scale).round().clamp(-127, 127).to(torch.int8)
+                    # Quantize new K,V using per-row Triton kernel
+                    use_triton = getattr(self.config, 'kv_quant_backend', 'pytorch') == 'triton' and HAS_TRITON
+                    if use_triton:
+                        # Per-row quantization: returns (B, nh, T, hs) and (B, nh, T)
+                        k_quant, k_scale = triton_int8_quant(k)
+                        v_quant, v_scale = triton_int8_quant(v)
+                    else:
+                        # PyTorch per-row quantization
+                        k_amax = k.abs().amax(dim=-1, keepdim=True)
+                        k_scale = torch.where(k_amax > 0, k_amax / 127.0, torch.ones_like(k_amax))
+                        k_quant = (k / k_scale).round().clamp(-127, 127).to(torch.int8)
+                        k_scale = k_scale.squeeze(-1)  # (B, nh, T)
+                        v_amax = v.abs().amax(dim=-1, keepdim=True)
+                        v_scale = torch.where(v_amax > 0, v_amax / 127.0, torch.ones_like(v_amax))
+                        v_quant = (v / v_scale).round().clamp(-127, 127).to(torch.int8)
+                        v_scale = v_scale.squeeze(-1)  # (B, nh, T)
                     # Update cache in-place
                     kv_cache.update(cache_layer_idx, k_quant, v_quant, k_scale, v_scale)
                 else:
@@ -259,9 +276,9 @@ class CausalSelfAttention(nn.Module):
                 layer_cache = kv_cache.get(cache_layer_idx, include_new=T)
                 if self.config.kv_cache_quant:
                     (k_quant, k_scale), (v_quant, v_scale) = layer_cache
-                    # Per-token dequantization: scale is (seq_len,), broadcast to (1, 1, seq_len, 1)
-                    k = k_quant.to(q.dtype) * k_scale.view(1, 1, -1, 1)
-                    v = v_quant.to(q.dtype) * v_scale.view(1, 1, -1, 1)
+                    # Per-row dequantization: scale is (B, nh, seq_len), broadcast to (B, nh, seq_len, 1)
+                    k = (k_quant.float() * k_scale.unsqueeze(-1)).to(q.dtype)
+                    v = (v_quant.float() * v_scale.unsqueeze(-1)).to(q.dtype)
                 else:
                     k, v = layer_cache
 
@@ -272,8 +289,9 @@ class CausalSelfAttention(nn.Module):
             if self.config.kv_cache_quant:
                 # INT8 path: dequantize cache, concat with new K,V
                 (past_key_q, past_key_s), (past_value_q, past_value_s) = layer_past
-                past_key = past_key_q.to(q.dtype) * past_key_s
-                past_value = past_value_q.to(q.dtype) * past_value_s
+                # Per-row dequantization: scale is (B, nh, T), broadcast to (B, nh, T, 1)
+                past_key = (past_key_q.float() * past_key_s.unsqueeze(-1)).to(q.dtype)
+                past_value = (past_value_q.float() * past_value_s.unsqueeze(-1)).to(q.dtype)
                 if can_borrow:
                     k, v = past_key, past_value
                 else:
@@ -291,13 +309,20 @@ class CausalSelfAttention(nn.Module):
         if not use_kv_cache:
             if use_cache:
                 if self.config.kv_cache_quant and is_cache_owner:
-                    # Quantize for storage (saves memory, costs some compute)
-                    k_absmax = k.abs().max()
-                    k_scale = k_absmax / 127.0 if k_absmax > 0 else torch.tensor(1.0, device=k.device, dtype=k.dtype)
-                    k_quant = (k / k_scale).round().clamp(-127, 127).to(torch.int8)
-                    v_absmax = v.abs().max()
-                    v_scale = v_absmax / 127.0 if v_absmax > 0 else torch.tensor(1.0, device=v.device, dtype=v.dtype)
-                    v_quant = (v / v_scale).round().clamp(-127, 127).to(torch.int8)
+                    # Per-row quantization for storage
+                    use_triton = getattr(self.config, 'kv_quant_backend', 'pytorch') == 'triton' and HAS_TRITON
+                    if use_triton:
+                        k_quant, k_scale = triton_int8_quant(k)
+                        v_quant, v_scale = triton_int8_quant(v)
+                    else:
+                        k_amax = k.abs().amax(dim=-1, keepdim=True)
+                        k_scale = torch.where(k_amax > 0, k_amax / 127.0, torch.ones_like(k_amax))
+                        k_quant = (k / k_scale).round().clamp(-127, 127).to(torch.int8)
+                        k_scale = k_scale.squeeze(-1)
+                        v_amax = v.abs().amax(dim=-1, keepdim=True)
+                        v_scale = torch.where(v_amax > 0, v_amax / 127.0, torch.ones_like(v_amax))
+                        v_quant = (v / v_scale).round().clamp(-127, 127).to(torch.int8)
+                        v_scale = v_scale.squeeze(-1)
                     present = ((k_quant, k_scale), (v_quant, v_scale))
                 else:
                     present = (k, v)
@@ -390,6 +415,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     cross_layer_sharing: bool = False # Toggles the cross-layer sharing hack
     kv_cache_quant: bool = False # Toggles INT8 quantization for KV cache
+    kv_quant_backend: str = 'pytorch' # 'pytorch' or 'triton' for INT8 quantization
     cross_layer_q_alignment: bool = False # Align borrower Q weights with owner (experimental)
 
 class GPT(nn.Module):
@@ -559,7 +585,7 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None, override_kv_cache_quant=None,
-                        override_cross_layer_q_alignment=None):
+                        override_cross_layer_q_alignment=None, override_kv_quant_backend=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
@@ -586,6 +612,10 @@ class GPT(nn.Module):
         if override_kv_cache_quant is not None:
             print(f"overriding kv_cache_quant to {override_kv_cache_quant}")
             config_args['kv_cache_quant'] = override_kv_cache_quant
+        # override kv_quant_backend if desired
+        if override_kv_quant_backend is not None:
+            print(f"overriding kv_quant_backend to {override_kv_quant_backend}")
+            config_args['kv_quant_backend'] = override_kv_quant_backend
         # override cross_layer_q_alignment if desired (for experimental versions)
         if override_cross_layer_q_alignment is not None:
             print(f"overriding cross_layer_q_alignment to {override_cross_layer_q_alignment}")

@@ -38,6 +38,15 @@ VERSIONS = {
         'kv_cache_quant': True,
         'cross_layer_sharing': False,
     },
+    # v2t: Triton per-tensor quant - slower than PyTorch for small tensors
+    # Kept for reference; per-row kernel would need model.py refactor
+    'v2t': {
+        'description': '[EXP] KV-cache + INT8 (Triton)',
+        'use_cache': True,
+        'kv_cache_quant': True,
+        'kv_quant_backend': 'triton',
+        'cross_layer_sharing': False,
+    },
     'v3': {
         'description': 'KV-cache + cross-layer sharing',
         'use_cache': True,
@@ -103,7 +112,7 @@ def create_model(version: str, base_config: dict = None, pretrained: str = None)
     Create model for specified version.
 
     Args:
-        version: Version string (v0, v1, v2, v3, v4)
+        version: Version string (v0, v1, v2, v3, v4, v2t)
         base_config: Base model configuration dict (used if pretrained is None)
         pretrained: Pretrained model name (gpt2, gpt2-medium, etc.)
 
@@ -115,13 +124,15 @@ def create_model(version: str, base_config: dict = None, pretrained: str = None)
         raise ValueError(f"Unknown version: {version}. Available: {list(VERSIONS.keys())}")
 
     v_config = VERSIONS[version]
+    kv_quant_backend = v_config.get('kv_quant_backend', 'pytorch')
 
     if pretrained:
         # Load pretrained with version-specific settings
         model = GPT.from_pretrained(
             pretrained,
             override_kv_cache_quant=v_config['kv_cache_quant'],
-            override_cross_layer_q_alignment=v_config.get('cross_layer_q_alignment')
+            override_cross_layer_q_alignment=v_config.get('cross_layer_q_alignment'),
+            override_kv_quant_backend=kv_quant_backend,
         )
         # Set cross_layer_sharing in config (used at runtime)
         model.config.cross_layer_sharing = v_config['cross_layer_sharing']
@@ -131,6 +142,7 @@ def create_model(version: str, base_config: dict = None, pretrained: str = None)
         config = GPTConfig(
             **base_config,
             kv_cache_quant=v_config['kv_cache_quant'],
+            kv_quant_backend=kv_quant_backend,
             cross_layer_sharing=v_config['cross_layer_sharing']
         )
         model = GPT(config)
@@ -180,6 +192,7 @@ def get_model_config_dict(model):
         'dropout': model.config.dropout,
         'bias': model.config.bias,
         'kv_cache_quant': model.config.kv_cache_quant,
+        'kv_quant_backend': getattr(model.config, 'kv_quant_backend', 'pytorch'),
         'cross_layer_sharing': model.config.cross_layer_sharing,
     }
 
