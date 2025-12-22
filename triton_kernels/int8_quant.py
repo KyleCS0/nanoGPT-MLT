@@ -23,6 +23,57 @@ def pytorch_int8_quant_per_tensor(x):
 
 
 @triton.jit
+def _quant_tensor_kernel(
+    x_ptr, q_ptr,
+    numel,
+    inv_scale,
+    BLOCK: tl.constexpr,
+):
+    """Quantize elements using pre-computed inverse scale."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    q = x * inv_scale
+    q = tl.floor(q + 0.5)
+    q = tl.maximum(tl.minimum(q, 127.0), -127.0)
+    tl.store(q_ptr + offs, q.to(tl.int8), mask=mask)
+
+
+def triton_int8_quant_per_tensor(x):
+    """Fused per-tensor INT8 quantization using Triton. Returns (q, scale)."""
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    # Use PyTorch for reduction (efficient on GPU)
+    amax = x.abs().max()
+    if amax > 0:
+        scale = amax / 127.0
+        inv_scale = float(127.0 / amax)
+    else:
+        scale = torch.tensor(1.0, device=x.device, dtype=x.dtype)
+        inv_scale = 0.0
+
+    # Flatten for quantization
+    x_flat = x.view(-1)
+    numel = x_flat.numel()
+    q_flat = torch.empty_like(x_flat, dtype=torch.int8)
+
+    BLOCK = 1024
+    grid = ((numel + BLOCK - 1) // BLOCK,)
+
+    _quant_tensor_kernel[grid](
+        x_flat, q_flat,
+        numel,
+        inv_scale,
+        BLOCK=BLOCK,
+    )
+
+    return q_flat.view(x.shape), scale
+
+
+@triton.jit
 def _quant_kernel(
     x_ptr, q_ptr, scale_ptr,
     M, K,
